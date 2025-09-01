@@ -25,7 +25,16 @@ from math import isclose
 from numbers import Number
 from os.path import splitext
 from pathlib import Path
-from typing import Callable, Dict, Iterator, NamedTuple, Optional, Union
+from typing import (
+    Any,
+    Callable,
+    ContextManager,
+    Dict,
+    Iterator,
+    NamedTuple,
+    Optional,
+    Union,
+)
 
 try:
     from cryptography.hazmat.primitives.serialization import pkcs12
@@ -58,15 +67,11 @@ from .deprecation import (
     get_stack_level,
     support_deprecated_txt_arg,
 )
+from .drawing_primitives import DeviceRGB, Point, Transform, convert_to_device_color
 from .drawing import (
-    DeviceRGB,
     DrawingContext,
-    GraphicsStateDictRegistry,
     GraphicsStyle,
     PaintedPath,
-    Point,
-    Transform,
-    convert_to_device_color,
 )
 from .encryption import StandardSecurityHandler
 from .enums import (
@@ -80,6 +85,7 @@ from .enums import (
     EncryptionMethod,
     FileAttachmentAnnotationName,
     MethodReturnValue,
+    OutputIntentSubType,
     PageLabelStyle,
     PageLayout,
     PageMode,
@@ -94,10 +100,9 @@ from .enums import (
     WrapMode,
     XPos,
     YPos,
-    OutputIntentSubType,
 )
 from .errors import FPDFException, FPDFPageFormatException, FPDFUnicodeEncodingException
-from .fonts import CoreFont, CORE_FONTS, FontFace, TextStyle, TitleStyle, TTFFont
+from .fonts import CORE_FONTS, CoreFont, FontFace, TextStyle, TitleStyle, TTFFont
 from .graphics_state import GraphicsStateMixin
 from .html import HTML2FPDF
 from .image_datastructures import (
@@ -112,23 +117,23 @@ from .image_parsing import (
     load_image,
     preload_image,
 )
-from .linearization import LinearizedOutputProducer
 from .line_break import (
     Fragment,
     MultiLineBreak,
     TextLine,
     TotalPagesSubstitutionFragment,
 )
+from .linearization import LinearizedOutputProducer
 from .outline import OutlineSection
 from .output import (
     ZOOM_CONFIGS,
+    OutputIntentDictionary,
     OutputProducer,
+    PDFICCProfile,
     PDFPage,
     PDFPageLabel,
     ResourceCatalog,
     stream_content_for_raster_image,
-    PDFICCProfile,
-    OutputIntentDictionary,
 )
 from .recorder import FPDFRecorder
 from .sign import Signature
@@ -136,13 +141,13 @@ from .structure_tree import StructureTreeBuilder
 from .svg import Percent, SVGObject
 from .syntax import DestinationXYZ, PDFArray, PDFDate
 from .table import Table, draw_box_borders
-from .text_region import TextRegionMixin, TextColumns
+from .text_region import TextColumns, TextRegionMixin
 from .transitions import Transition
 from .unicode_script import UnicodeScript, get_unicode_script
-from .util import get_scale_factor, Padding
+from .util import Padding, get_scale_factor
 
 # Public global variables:
-FPDF_VERSION = "2.8.3"
+FPDF_VERSION = "2.8.4"
 PAGE_FORMATS = {
     "a3": (841.89, 1190.55),
     "a4": (595.28, 841.89),
@@ -234,8 +239,6 @@ class FPDF(GraphicsStateMixin, TextRegionMixin):
     MARKDOWN_LINK_REGEX = re.compile(r"^\[([^][]+)\]\(([^()]+)\)(.*)$", re.DOTALL)
     MARKDOWN_LINK_COLOR = None
     MARKDOWN_LINK_UNDERLINE = True
-    _GS_REGEX = re.compile(r"/(GS\d+) gs")
-    _IMG_REGEX = re.compile(r"/I(\d+) Do")
 
     HTML2FPDF_CLASS = HTML2FPDF
 
@@ -372,9 +375,9 @@ class FPDF(GraphicsStateMixin, TextRegionMixin):
         self._security_handler = None
         self._fallback_font_ids = []
         self._fallback_font_exact_match = False
+        self.render_color_fonts = True
 
         self._current_draw_context = None
-        self._drawing_graphics_state_registry = GraphicsStateDictRegistry()
         # map page numbers to a set of GraphicsState names:
         self._record_text_quad_points = False
         self._resource_catalog = ResourceCatalog()
@@ -442,7 +445,7 @@ class FPDF(GraphicsStateMixin, TextRegionMixin):
             warn_on_tags_not_matching (bool): control warnings production for unmatched HTML tags. Defaults to `True`.
             tag_indents (dict): [**DEPRECATED since v2.8.0**]
                 mapping of HTML tag names to numeric values representing their horizontal left indentation. - Set `tag_styles` instead
-            tag_styles (dict[str, fpdf.fonts.TextStyle]): mapping of HTML tag names to `fpdf.TextStyle` or `fpdf.FontFace` instances
+            tag_styles (dict[str, fpdf.fonts.TextStyle]): mapping of HTML tag names to `fpdf.fonts.TextStyle` or `fpdf.fonts.FontFace` instances
         """
         html2pdf = self.HTML2FPDF_CLASS(self, *args, **kwargs)
         with self.local_context():
@@ -539,7 +542,11 @@ class FPDF(GraphicsStateMixin, TextRegionMixin):
     @property
     def pages_count(self):
         """
-        Returns the total pages of the document.
+        Returns the total pages of the document, at the time it is called.
+
+        Do not use this in `fpdf.fpdf.FPDF.header()` or `fpdf.fpdf.FPDF.footer()`,
+        as its value will not be the total page count.
+        Uses `{nb}` instead, _cf._ `fpdf.fpdf.FPDF.alias_nb_pages()`.
         """
         return len(self.pages)
 
@@ -604,8 +611,10 @@ class FPDF(GraphicsStateMixin, TextRegionMixin):
 
     def set_auto_page_break(self, auto, margin=0):
         """
-        Set auto page break mode and triggering bottom margin.
+        Set auto page break mode, and optionally the bottom margin that triggers it.
         By default, the mode is on and the bottom margin is 2 cm.
+
+        Detailed documentation on page breaks: https://py-pdf.github.io/fpdf2/PageBreaks.html
 
         Args:
             auto (bool): enable or disable this mode
@@ -889,7 +898,11 @@ class FPDF(GraphicsStateMixin, TextRegionMixin):
                 meaning to use the best image filter given the images provided.
                 Allowed values: `FlateDecode` (lossless zlib/deflate compression),
                 `DCTDecode` (lossy compression with JPEG)
+                `LZWDecode` (Lempel-Ziv-Welch aka LZW compression)
                 and `JPXDecode` (lossy compression with JPEG2000).
+
+        [**NEW in 2.8.4**] Note that, when using `LZWDecode`, having NumPy installed
+        will improve performances, reducing execution time.
         """
         if image_filter not in SUPPORTED_IMAGE_FILTERS:
             raise ValueError(
@@ -911,7 +924,7 @@ class FPDF(GraphicsStateMixin, TextRegionMixin):
         This substitution can be disabled for performances reasons, by calling `alias_nb_pages(None)`.
 
         Args:
-            alias (str): the alias. Defaults to "{nb}".
+            alias (str): the alias. Defaults to `"{nb}"`.
 
         Notes
         -----
@@ -1335,7 +1348,7 @@ class FPDF(GraphicsStateMixin, TextRegionMixin):
 
         starting_style = self._current_graphic_style()
         render_args = (
-            self._drawing_graphics_state_registry,
+            self._resource_catalog,
             Point(self.x, self.y),
             self.k,
             self.h,
@@ -1347,15 +1360,8 @@ class FPDF(GraphicsStateMixin, TextRegionMixin):
         else:
             rendered = context.render(*render_args)
 
-        for match in self._GS_REGEX.finditer(rendered):
-            self._resource_catalog.add(
-                PDFResourceType.EXT_G_STATE, match.group(1), self.page
-            )
-        # Registering raster images embedded in the vector graphics:
-        for match in self._IMG_REGEX.finditer(rendered):
-            self._resource_catalog.add(
-                PDFResourceType.X_OBJECT, int(match.group(1)), self.page
-            )
+        # Let the catalog scan & register resources used by this drawing:
+        self._resource_catalog.index_stream_resources(rendered, self.page)
         # Once we handle text-rendering SVG tags (cf. PR #1029),
         # we should also detect fonts used and add them to the resource catalog
 
@@ -1369,7 +1375,7 @@ class FPDF(GraphicsStateMixin, TextRegionMixin):
         """
         Create a context for using a shading pattern on the current page.
         """
-        self._resource_catalog.add(PDFResourceType.SHADDING, shading, self.page)
+        self._resource_catalog.add(PDFResourceType.SHADING, shading, self.page)
         pattern = shading.get_pattern()
         pattern_name = self._resource_catalog.add(
             PDFResourceType.PATTERN, pattern, self.page
@@ -1475,6 +1481,63 @@ class FPDF(GraphicsStateMixin, TextRegionMixin):
         else:
             dstr = "[] 0 d"
         self._out(dstr)
+
+    @contextmanager
+    def glyph_drawing_context(self):
+        """
+        Create a context for drawing paths for type 3 font glyphs, without writing on the current page.
+        """
+
+        if self._current_draw_context is not None:
+            raise FPDFException(
+                "cannot create a drawing context while one is already open"
+            )
+
+        context = DrawingContext()
+        self._current_draw_context = context
+        try:
+            yield context
+        finally:
+            self._current_draw_context = None
+
+        self._set_min_pdf_version("1.4")
+
+    def draw_vector_glyph(self, path, font):
+        """
+        Add a pre-constructed path to the document.
+
+        Args:
+            path (drawing.PaintedPath): the path to be drawn.
+            debug_stream (TextIO): print a pretty tree of all items to be rendered
+                to the provided stream. To store the output in a string, use
+                `io.StringIO`.
+        """
+        output_stream = None
+        with self.glyph_drawing_context() as ctxt:
+            ctxt.add_item(path)
+
+            starting_style = GraphicsStyle()
+            render_args = (
+                self._resource_catalog,
+                Point(0, 0),
+                1,
+                0,
+                starting_style,
+            )
+
+            output_stream = ctxt.render(*render_args)
+            # Registering raster images embedded in the vector graphics:
+            for resource_type, resource_id in self._resource_catalog.scan_stream(
+                output_stream
+            ):
+                if resource_type == PDFResourceType.X_OBJECT:
+                    font.images_used.add(int(resource_id))
+                if resource_type == PDFResourceType.EXT_G_STATE:
+                    font.graphics_style_used.add(resource_id)
+                if resource_type == PDFResourceType.PATTERN:
+                    font.patterns_used.add(resource_id)
+
+        return output_stream
 
     @check_page
     def line(self, x1, y1, x2, y2):
@@ -1798,7 +1861,7 @@ class FPDF(GraphicsStateMixin, TextRegionMixin):
                 math.radians((360 / numSides) * i) + math.radians(rotateDegrees)
             )
             points.append(point)
-        # creates list of touples containing cordinate points of vertices
+        # creates list of touples containing coordinate points of vertices
 
         self.polygon(points, style=style)
         # passes points through polygon function
@@ -3089,7 +3152,7 @@ class FPDF(GraphicsStateMixin, TextRegionMixin):
             else:
                 raise ValueError(f"Unsupported setting: {key}")
         if gs:
-            gs_name = self._drawing_graphics_state_registry.register_style(gs)
+            gs_name = self._resource_catalog.register_graphics_style(gs)
             self._resource_catalog.add(PDFResourceType.EXT_G_STATE, gs_name, self.page)
             self._out(f"q /{gs_name} gs")
         else:
@@ -3126,11 +3189,15 @@ class FPDF(GraphicsStateMixin, TextRegionMixin):
     @property
     def accept_page_break(self):
         """
-        Whenever a page break condition is met, this method is called,
+        Whenever a page break condition is met, this `@property` method is called,
         and the break is issued or not depending on the returned value.
 
-        The default implementation returns a value according to the mode selected by `FPDF.set_auto_page_break()`.
+        The default implementation returns `self.auto_page_break`,
+        a value according to the mode selected by `FPDF.set_auto_page_break()`.
+
         This method is called automatically and should not be called directly by the application.
+
+        Detailed documentation on page breaks: https://py-pdf.github.io/fpdf2/PageBreaks.html
         """
         return self.auto_page_break
 
@@ -3750,12 +3817,10 @@ class FPDF(GraphicsStateMixin, TextRegionMixin):
             gstate["strikethrough"] = in_strikethrough
             gstate["underline"] = in_underline
             if current_fallback_font:
-                gstate["font_family"] = "".join(
-                    c for c in current_fallback_font if c.islower()
-                )
-                gstate["font_style"] = "".join(
-                    c for c in current_fallback_font if c.isupper()
-                )
+                style = "".join(c for c in current_fallback_font if c in ("BI"))
+                family = current_fallback_font.replace("B", "").replace("I", "")
+                gstate["font_family"] = family
+                gstate["font_style"] = style
                 gstate["current_font"] = self.fonts[current_fallback_font]
                 current_fallback_font = None
                 current_text_script = None
@@ -3888,6 +3953,8 @@ class FPDF(GraphicsStateMixin, TextRegionMixin):
         Let you know if adding an element will trigger a page break,
         based on its height and the current ordinate (`y` position).
 
+        Detailed documentation on page breaks: https://py-pdf.github.io/fpdf2/PageBreaks.html
+
         Args:
             height (float): height of the section that would be added, e.g. a cell
 
@@ -3913,9 +3980,11 @@ class FPDF(GraphicsStateMixin, TextRegionMixin):
         return False
 
     def _perform_page_break(self):
-        # Defensive check, this should have tested by a previous call to .will_page_break():
-        if not self.accept_page_break or self.in_footer:
-            return
+        """
+        Performs a page break, taking care to preserve self.x
+        and a potential existing `fpdf.fpdf.FPDF.local_context()`.
+        A call to `fpdf.fpdf.FPDF.will_page_break()` should be performed beforehand.
+        """
         x = self.x
         # If we are in a .local_context(), we need to temporarily leave it,
         # by popping out every GraphicsState:
@@ -4788,6 +4857,11 @@ class FPDF(GraphicsStateMixin, TextRegionMixin):
         )
         return preload_image(self.image_cache, name, dims)
 
+    def preload_glyph_image(self, glyph_image_bytes):
+        return preload_image(
+            image_cache=self.image_cache, name=glyph_image_bytes, dims=None
+        )
+
     @contextmanager
     def _marked_sequence(self, **kwargs):
         """
@@ -5312,6 +5386,8 @@ class FPDF(GraphicsStateMixin, TextRegionMixin):
         Ensures that all rendering performed in this context appear on a single page
         by performing page break beforehand if need be.
 
+        Detailed documentation on page breaks: https://py-pdf.github.io/fpdf2/PageBreaks.html
+
         Notes
         -----
 
@@ -5577,7 +5653,7 @@ class FPDF(GraphicsStateMixin, TextRegionMixin):
 
     @check_page
     @contextmanager
-    def table(self, *args, **kwargs):
+    def table(self, *args: Any, **kwargs: Any) -> ContextManager[Table]:
         """
         Inserts a table, that can be built using the `fpdf.table.Table` object yield.
         Detailed usage documentation: https://py-pdf.github.io/fpdf2/Tables.html
@@ -5667,6 +5743,9 @@ class FPDF(GraphicsStateMixin, TextRegionMixin):
                                 str(self.pages_count)
                             ).encode("latin-1"),
                         )
+            for _, font in self.fonts.items():
+                if font.type == "TTF" and font.color_font:
+                    font.color_font.load_glyphs()
             if linearize:
                 output_producer_class = LinearizedOutputProducer
             output_producer = output_producer_class(self)

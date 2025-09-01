@@ -1496,6 +1496,33 @@
       "contributions": [
         "doc"
       ]
+    },
+    {
+      "login": "pratstick",
+      "name": "Pratyush ",
+      "avatar_url": "https://avatars.githubusercontent.com/u/116508117?v=4",
+      "profile": "https://github.com/pratstick",
+      "contributions": [
+        "doc"
+      ]
+    },
+    {
+      "login": "dlespiau",
+      "name": "Damien",
+      "avatar_url": "https://avatars.githubusercontent.com/u/7986?v=4",
+      "profile": "https://github.com/dlespiau",
+      "contributions": [
+        "code"
+      ]
+    },
+    {
+      "login": "dabell-cc",
+      "name": "David A. Bell",
+      "avatar_url": "https://avatars.githubusercontent.com/u/8835326?v=4",
+      "profile": "http://www.dabell.ca",
+      "contributions": [
+        "code"
+      ]
     }
   ],
   "contributorsPerLine": 7,

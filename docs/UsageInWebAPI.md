@@ -1,4 +1,4 @@
-# Usage in web APIs #
+# Usage in web APIs
 
 Note that `FPDF` instance objects are not designed to be reusable:
 **content cannot be added** once [`output()`](https://py-pdf.github.io/fpdf2/fpdf/fpdf.html#fpdf.fpdf.FPDF.output) has been called.
@@ -7,7 +7,7 @@ Hence, even if the `FPDF` class should be thread-safe, we recommend that you eit
 or if you want to use a global / shared object, to only store the bytes returned from `output()`.
 
 
-## Django ##
+## Django
 [Django](https://www.djangoproject.com/) is:
 > a high-level Python web framework that encourages rapid development and clean, pragmatic design
 
@@ -49,10 +49,8 @@ def hello_world():
 ```
 
 
-## gunicorn ##
-[Gunicorn 'Green Unicorn'](https://gunicorn.org/) is a Python WSGI HTTP Server for UNIX.
-
-The following code can be placed in a `gunicorn_fpdf2.py` file and launched using `gunicorn -w 4 gunicorn_fpdf2:app`:
+## WSGI applications
+The following code can be placed in a `fpdf2_app.py` to make a WSGI application
 
 ```python
 from fpdf import FPDF
@@ -70,8 +68,14 @@ def app(environ, start_response):
     return iter([data])
 ```
 
+This script can then be served as a HTTP application using either:
+* the standard [`wsgiref`](https://docs.python.org/3/library/wsgiref.html) module
+* [`werkzeug.serving.run_simple`](https://werkzeug.palletsprojects.com/en/stable/serving/)
+* [Gunicorn](https://gunicorn.org/), using: `gunicorn --bind localhost:8000 fpdf2_app:app`
+* [uWSGI](https://uwsgi-docs.readthedocs.io/en/latest/), using: `uwsgi --http :8000 --module fpdf2_app:app`
 
-## AWS lambda ##
+
+## AWS lambda
 The following code demonstrates some minimal [AWS lambda handler function](https://docs.aws.amazon.com/lambda/latest/dg/python-handler.html)
 that returns a PDF file as binary output:
 ```python
@@ -135,7 +139,7 @@ Those commands do not cover the creation of the `lambda-fpdf2-role` role,
 nor configuring the lambda access permissions, for example with a `FunctionURLAllowPublicAccess` resource-based policy.
 
 
-## streamlit ##
+## streamlit
 [streamlit](https://streamlit.io) is:
 > a Python library that makes it easy to create and share custom web apps for data science
 
@@ -171,7 +175,7 @@ st.download_button(
 ```
 
 
-## FastAPI ##
+## FastAPI
 [FastAPI](https://fastapi.tiangolo.com/) is:
 > a modern, fast (high-performance), web framework for building APIs with Python 3.7+ based on standard Python type hints.
 
@@ -224,11 +228,11 @@ async def create_pdf(request: Request):
 ```
 
 
-## Jupyter ##
+## Jupyter
 Check [tutorial/notebook.ipynb](https://github.com/py-pdf/fpdf2/blob/master/tutorial/notebook.ipynb)
 
 
-## web2py ##
-Usage of the original PyFPDF lib with [web2py](http://www.web2py.com/) is described here: <https://github.com/reingart/pyfpdf/blob/master/docs/Web2Py.md>
+## web2py
+Usage of [the original PyFPDF library](History.md) with [web2py](http://www.web2py.com/) is described here: <https://github.com/reingart/pyfpdf/blob/master/docs/Web2Py.md>
 
 `v1.7.2` of PyFPDF is included in `web2py` since release `1.85.2`: <https://github.com/web2py/web2py/tree/master/gluon/contrib/fpdf>

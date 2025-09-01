@@ -1,5 +1,5 @@
 # Templates
-Templates are a `fpdf2` feature that define predefined documents (like invoices, tax forms, etc.), or parts of such documents, where each element (text, lines, barcodes, etc.) has a fixed position (x1, y1, x2, y2), style (font, size, etc.) and a default text.
+Templates are a `fpdf2` feature that define predefined documents (like invoices, tax forms, etc.), or parts of such documents, where each element (text, lines, barcodes, etc.) has a fixed position (`x1`, `y1`, `x2`, `y2`), style (`font`, `size`, etc.) and a default text.
 
 These elements can act as placeholders, so the program can change the default text "filling in" the document.
 
@@ -11,7 +11,9 @@ There are two approaches to using templates:
 
 
 ## Using Template
-The traditional approach is to use the `Template` class, This class accepts one template definition, and can apply it to each page of a document. The usage pattern here is:
+The traditional approach is to use the [`Template`](https://py-pdf.github.io/fpdf2/fpdf/template.html#fpdf.template.Template) class.
+This class accepts one template definition, and can apply it to each page of a document.
+The usage pattern here is:
 
 ```python
 tmpl = Template(elements=elements)
@@ -36,9 +38,9 @@ tmpl.render(outfile="example.pdf")
 
 The `Template` class will create and manage its own `FPDF` instance, so you don't need to worry about how it all works together. It also allows to set the page format, title of the document, measuring unit, and other metadata for the PDF file.
 
-For the method signatures, see [py-pdf.github.io: class Template](https://py-pdf.github.io/fpdf2/fpdf/template.html#fpdf.template.Template).
+Check the dedicated page for the full method signatures: [`Template`](https://py-pdf.github.io/fpdf2/fpdf/template.html#fpdf.template.Template).
 
-You can also check [test/template/test_template.py](https://github.com/py-pdf/fpdf2/blob/master/test/template/test_template.py) for usage examples of `Template`.
+You can also check the unit tests in [test_template.py](https://github.com/py-pdf/fpdf2/blob/master/test/template/test_template.py) for more usage examples of `Template`.
 
 Setting text values for specific template items is done by treating the class as a dict, with the name of the item as the key:
 
@@ -48,8 +50,8 @@ Template["company_name"] = "Sample Company"
 
 
 ## Using FlexTemplate
-When more flexibility is desired, then the `FlexTemplate` class comes into play.
-In this case, you first need to create your own `FPDF` instance. You can then pass this to the constructor of one or several `FlexTemplate` instances, and have each of them load a template definition. For any page of the document, you can set text values on a template, and then render it on that page. After rendering, the template will be reset to its default values.
+When more flexibility is desired, then the [`FlexTemplate`](https://py-pdf.github.io/fpdf2/fpdf/template.html#fpdf.template.FlexTemplate) class comes into play.
+In this case, you first need to create your own [`FPDF`](https://py-pdf.github.io/fpdf2/fpdf/fpdf.html#fpdf.fpdf.FPDF) instance. You can then pass this to the constructor of one or several `FlexTemplate` instances, and have each of them load a template definition. For any page of the document, you can set text values on a template, and then render it on that page. After rendering, the template will be reset to its default values.
  
 ```python
 from fpdf import FlexTemplate, FPDF
@@ -141,9 +143,9 @@ templ.render(offsetx=120, offsety=120, rotate=30.0, scale=0.5)
 pdf.output("example.pdf")
 ```
 
-For the method signatures, see [py-pdf.github.io: class FlexTemplate](https://py-pdf.github.io/fpdf2/fpdf/template.html#fpdf.template.FlexTemplate).
+Check the dedicated page for the full method signatures: [`FlexTemplate`](https://py-pdf.github.io/fpdf2/fpdf/template.html#fpdf.template.FlexTemplate).
 
-You can also check [test/template/test_flextemplate.py](https://github.com/py-pdf/fpdf2/blob/master/test/template/test_flextemplate.py) for usage examples of `FlexTemplate`.
+You can also check the unit tests in [test_flextemplate.py](https://github.com/py-pdf/fpdf2/blob/master/test/template/test_flextemplate.py) for more usage examples of `FlexTemplate`.
 
 The dict syntax for setting text values is the same as above:
 
@@ -153,81 +155,85 @@ FlexTemplate["company_name"] = "Sample Company"
 
 
 ## Details - Template definition
-A template definition consists of a number of elements, which have the
-following properties (columns in a CSV, items in a dict, name/value pairs in a
-JSON object, fields in a database). Dimensions (except font size, which always
-uses points) are given in user defined units (default: mm). Those are the units
-that can be specified when creating a `Template` or a `FPDF` instance.
+A template definition consists of a number of elements, which have the following properties
+(columns in a CSV, items in a dict, name/value pairs in a JSON object, fields in a database).
+Dimensions (except font size, which always uses points) are given in user defined units (default: mm).
+Those are the units that can be specified when creating a [`Template`](https://py-pdf.github.io/fpdf2/fpdf/template.html#fpdf.template.Template)
+or a [`FPDF`](https://py-pdf.github.io/fpdf2/fpdf/fpdf.html#fpdf.fpdf.FPDF) instance.
 
-* __name__: placeholder identification (unique text string)
+* **`name`**: placeholder identification (unique text string)
     * _mandatory_
-* __type__:
-    * '__T__': Text - places one or several lines of text on the page
-    * '__L__': Line - draws a line from x1/y1 to x2/y2
-    * '__I__': Image - positions and scales an image into the bounding box
-    * '__B__': Box - draws a rectangle around the bounding box
-    * '__E__': Ellipse - draws an ellipse inside the bounding box
-    * '__BC__': Barcode - inserts an "Interleaved 2 of 5" type barcode
-    * '__C39__': Code 39 - inserts a "Code 39" type barcode
-        * Incompatible change: A previous implementation of this type used the non-standard element keys "x", "y", "w", and "h", which are now deprecated (but still work for the moment).
-    * '__W__': "Write" - uses the `FPDF.write()` method to add text to the page
+* **`type`**:
+    * **`T`**: Text - places one or several lines of text on the page
+    * **`L`**: Line - draws a line from `x1`/`y1` to `x2`/`y2`
+    * **`I`**: Image - positions and scales an image into the bounding box
+    * **`B`**: Box - draws a rectangle around the bounding box
+    * **`E`**: Ellipse - draws an ellipse inside the bounding box
+    * **`BC`**: Barcode - inserts an [Interleaved 2 of 5](http://127.0.0.1:8000/fpdf2/Barcodes.html#interleaved-2-of-5) type barcode
+    * **`C39`**: Code 39 - inserts a [Code 39](http://127.0.0.1:8000/fpdf2/Barcodes.html#code-39) type barcode
+    * **`W`**: "Write" - uses the [`FPDF.write()`](https://py-pdf.github.io/fpdf2/fpdf/fpdf.html#fpdf.fpdf.FPDF.write) method to add text to the page
     * _mandatory_
-* __x1, y1, x2, y2__: top-left, bottom-right coordinates, defining a bounding box in most cases
+* **`x1, y1, x2, y2`**: top-left, bottom-right coordinates, defining a bounding box in most cases
     * for multiline text, this is the bounding box of just the first line, not the complete box
-    * for the barcodes types, the height of the barcode is `y2 - y1`, x2 is ignored.
-    * _mandatory_ ("x2" _optional_ for the barcode types)
-* __font__: the name of a font type for the text types
+    * for the barcodes types, the height of the barcode is `y2 - y1`, `x2` is ignored.
+    * _mandatory_ (`x2` _optional_ for the barcode types)
+* **`font`**: the name of a font type for the text types
     * _optional_
-    * default: "helvetica"
-* __size__: the size property of the element (float value)
+    * default: `helvetica`
+* **`size`**: the size property of the element (float value)
     * for text, the font size (in points!)
     * for line, box, and ellipse, the line width
     * for the barcode types, the width of one bar 
     * _optional_
-    * default: 10 for text, 2 for 'BC', 1.5 for 'C39'
-* __bold, italic, underline__: text style properties
+    * default: `10` for text, `2` for `BC`, `1.5` for `C39`
+* **`__dash_pattern__(__dash__, __gap__, __phase__)`**: a dict of the line dash pattern for the element
+    * _optional_
+    * for line, box, ellipse follows the parameters of [set_dash_pattern()](https://py-pdf.github.io/fpdf2/fpdf/fpdf.html#fpdf.fpdf.FPDF.set_dash_pattern) 
+    * Only supported in dict/JSON
+    * `__dash__`,`__gap__`, and `__phase__` keys are possible, at least dash must be present. 
+    * default: dash=0 (solid lines)
+* **`bold, italic, underline`**: text style properties
     * in dict/JSON, enabled with True/true or equivalent value
     * in CSV, only int values, 0 as false, non-0 as true
     * _optional_
-    * default: false
-* __foreground, background__: text and fill colors (int value, commonly given in hex as 0xRRGGBB)
-    * in JSON, a decimal value or a HTML style "#RRGGBB" string (6 digits) can be given.
+    * default: `false`
+* **`foreground, background`**: text and fill colors (int value, commonly given in hex as `0xRRGGBB`)
+    * in JSON, a decimal value or a HTML style `#RRGGBB` string (6 digits) can be given.
     * _optional_
-    * default: foreground 0x000000 = black; background None/empty = transparent
-    * Incompatible change: Up to 2.4.5, the default background for text and box elements was solid white, with no way to make them transparent.
-* __align__: text alignment, '__L__': left, '__R__': right, '__C__': center
+    * default: foreground `0x000000` = black; background None/empty = transparent
+* **`align`**: text alignment, `L`: left, `R`: right, `C`: center
     * _optional_
     * default: 'L'
-* __text__: default string, can be replaced at runtime
-    * displayed text for 'T' and 'W'
+* **`text`**: default string, can be replaced at runtime
+    * displayed text for `T` and `W`
     * data to encode for barcode types
     * _optional_ (if missing for text/write, the element is ignored)
     * default: empty
-* __priority__: Z-order (int value)
+* **`priority`**: Z-order (int value)
     * _optional_
     * default: 0
-* __multiline__: configure text wrapping
+* **`multiline`**: configure text wrapping
     * in dicts/JSON, None/null for single line, True/true for multicells (multiple lines), False/false trims to exactly fit the space defined
     * in CSV, 0 for single line, >0 for multiple lines, <0 for exact fit
     * _optional_
     * default: single line
-* __rotation__: rotate the element in degrees around the top left corner x1/y1 (float)
+* **`rotation`**: rotate the element in degrees around the top left corner `x1`/`y1` (float)
     * _optional_
     * default: 0.0 - no rotation
-* __wrapmode__: optionally set wrapmode to "CHAR" to support multiline line wrapping on characters instead of words
+* **`wrapmode`**: optionally set wrapmode to `'CHAR'` to support multiline line wrapping on characters instead of words
     * _optional_
-    * default: 'WORD'
+    * default: `'WORD'`
 
-Fields that are not relevant to a specific element type will be ignored there, but if not left empty, they must still adhere to the specified data type (in dicts, string fields may be None).
+Fields that are not relevant to a specific element type will be ignored there,
+but if not left empty, they must still adhere to the specified data type (in dicts, string fields may be None).
 
 
 ## How to create a template
 A template can be created in several ways:
 
-  * By defining everything directly as a Python dictionary
-  * By reading the template definition from a JSON document with `.parse_json()`
-  * By reading the template definition from a CSV document with `.parse_csv()`
-  * By defining the template in a database (this applies to [Web2Py] (Web2Py.md) integration)
+* By defining everything directly as a Python dictionary - [example 1](#example-python-dict)
+* By reading the template definition from a JSON document with `.parse_json()` - [example 2](#example-elements-defined-in-json-file)
+* By reading the template definition from a CSV document with `.parse_csv()` - [example 3](#example-elements-defined-in-csv-file)
 
 
 ### Example - Python dict
@@ -258,8 +264,6 @@ f["company_logo"] = "docs/fpdf2-logo.png"
 #and now we render the page
 f.render("./template.pdf")
 ```
-
-See template.py or [Web2Py] (Web2Py.md) for a complete example.
 
 ### Example - Elements defined in JSON file
 _New in [:octicons-tag-24: 2.8.0](https://github.com/py-pdf/fpdf2/blob/master/CHANGELOG.md)_
@@ -311,8 +315,10 @@ rotated;T;21.0;80.0;100.0;84.0;times;10.5;0;0;0;0;;R;ROTATED;0;0;30.0
 ```
 
 Remember that each line represents an element and each field represents one of the properties of the element in the following order:
-('name','type','x1','y1','x2','y2','font','size','bold','italic','underline','foreground','background','align','text','priority', 'multiline', 'rotate', 'wrapmode')
-As noted above, most fields may be left empty, so a line is valid with only 6 items. The "empty\_fields" line of the example demonstrates all that can be left away. In addition, for the barcode types "x2" may be empty.
+`('name','type','x1','y1','x2','y2','font','size','bold','italic','underline','foreground','background','align','text','priority', 'multiline', 'rotate', 'wrapmode')`
+As noted above, most fields may be left empty, so a line is valid with only 6 items.
+The `empty_fields` line of the example demonstrates all that can be left away.
+In addition, for the barcode types, `x2` may be empty.
 
 Then you can use the file like this:
 

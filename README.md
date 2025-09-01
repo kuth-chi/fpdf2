@@ -59,7 +59,7 @@ pip install git+https://github.com/py-pdf/fpdf2.git@master
 
 ## Features
 
- * Python 3.8+ support
+ * Python 3.9+ support
  * [Unicode](https://py-pdf.github.io/fpdf2/Unicode.html) (UTF-8) TrueType font subset embedding
  * Internal / external [links](https://py-pdf.github.io/fpdf2/Links.html)
  * Embedding images, including transparency and alpha channel
@@ -325,6 +325,9 @@ This library could only exist thanks to the dedication of many volunteers around
     <tr>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/slkoo-core"><img src="https://avatars.githubusercontent.com/u/201556645?v=4?s=100" width="100px;" alt="slkoo-core"/><br /><sub><b>slkoo-core</b></sub></a><br /><a href="https://github.com/py-pdf/fpdf2/issues?q=author%3Aslkoo-core" title="Bug reports">🐛</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/eshentials"><img src="https://avatars.githubusercontent.com/u/144895187?v=4?s=100" width="100px;" alt="Eshani"/><br /><sub><b>Eshani</b></sub></a><br /><a href="https://github.com/py-pdf/fpdf2/commits?author=eshentials" title="Documentation">📖</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/pratstick"><img src="https://avatars.githubusercontent.com/u/116508117?v=4?s=100" width="100px;" alt="Pratyush "/><br /><sub><b>Pratyush </b></sub></a><br /><a href="https://github.com/py-pdf/fpdf2/commits?author=pratstick" title="Documentation">📖</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/dlespiau"><img src="https://avatars.githubusercontent.com/u/7986?v=4?s=100" width="100px;" alt="Damien"/><br /><sub><b>Damien</b></sub></a><br /><a href="https://github.com/py-pdf/fpdf2/commits?author=dlespiau" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="http://www.dabell.ca"><img src="https://avatars.githubusercontent.com/u/8835326?v=4?s=100" width="100px;" alt="David A. Bell"/><br /><sub><b>David A. Bell</b></sub></a><br /><a href="https://github.com/py-pdf/fpdf2/commits?author=dabell-cc" title="Code">💻</a></td>
     </tr>
   </tbody>
 </table>

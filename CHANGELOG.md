@@ -16,11 +16,25 @@ in order to get warned about deprecated features used in your code.
 
 This can also be enabled programmatically with `warnings.simplefilter('default', DeprecationWarning)`.
 
-## [2.8.4] - Not released yet
+## [2.8.5] - Not released yet
+### Added
+* basic support for SVG `currentColor` color value - _cf._ [PR #1531](https://github.com/py-pdf/fpdf2/pull/1531)
+* Porter–Duff compositing operations and bounding box support to the drawing API
+* support gradients as fill or stroke colors in the drawing API
+* support for dashed lines in FlexTemplate elements - _cf._ [issue #1503](https://github.com/py-pdf/fpdf2/issues/1503)
+* support for rendering color font glyphs in different formats (SBIX, CBDT/CBLC, SVG, COLRv0 and COLRv1)
+
+### Fixed
+* preserving font table `fvar` to keep compatibility with variable fonts - _cf._ [issue #1528](https://github.com/py-pdf/fpdf2/issues/1528)
+* issue with markdown when fallback fonts containing non-alphanumeric characters are used - _cf._ [issue #1535](https://github.com/py-pdf/fpdf2/issues/1535)
+
+## [2.8.4] - 2025-08-11
 ### Added
 * documentation on [internal linking with variable page numbers](https://py-pdf.github.io/fpdf2/Links.html#internal-links)
 * documentation on [using the Ibis library](https://py-pdf.github.io/fpdf2/Maths.html#using-ibis)
 * clarified docstring for `arc()` method to document `x` and `y` arguments ([#1473](https://github.com/py-pdf/fpdf2/issues/1473))
+* made `numpy` an optional dependency to improve the performance of `pack_codes_into_bytes()` - _cf._ [issue #1380](https://github.com/py-pdf/fpdf2/issues/1380)
+* macOS is now included in the GitHub Actions CI pipeline to ensure cross-platform test coverage
 
 ### Fixed
 * [`FPDF.write_html()`](https://py-pdf.github.io/fpdf2/fpdf/fpdf.html#fpdf.fpdf.FPDF.write_html): Fixed custom styling of `<p>` & tables - [issue #1453](https://github.com/py-pdf/fpdf2/issues/1453)
@@ -31,8 +45,15 @@ This can also be enabled programmatically with `warnings.simplefilter('default',
 * a performance issue when using `FPDF.offset_rendering()` or `FPDF.unbreakable()` with large fonts - _cf._ [issue #1444](https://github.com/py-pdf/fpdf2/issues/1444)
 * slightly invalid PDF files were produced since v2.8.3, due to path construction commands being inserted inside `BT/ET` contexts when using underline or strikethrough text - _cf._ [issue #1456](https://github.com/py-pdf/fpdf2/issues/1456)
 * `multi_cell()` text clipping bug - [issue #1471](https://github.com/py-pdf/fpdf2/issues/1471)
+* HTML lists bullets are now properly displayed when using unicode fonts - _cf._ [issue #1496](https://github.com/py-pdf/fpdf2/issues/1496)
 * clarified documentation in [Maths.md](https://py-pdf.github.io/fpdf2/Maths.html) regarding DataFrame string conversion for PDF rendering
+* children of `<a>` tags in SVGs are now correctly rendered - _cf._ [PR #1522](https://github.com/py-pdf/fpdf2/pull/1522)
 
+### Changed
+* [`accept_page_break`](https://py-pdf.github.io/fpdf2/fpdf/fpdf.html#fpdf.fpdf.FPDF.accept_page_break) is now only called once per page break - _cf._ [issue #1489](https://github.com/py-pdf/fpdf2/issues/1489)
+
+### Removed
+* support for Python 3.8, that reached [end-of-life](https://devguide.python.org/versions/#supported-versions) in 2024
 
 ## [2.8.3] - 2025-04-22
 ### Added

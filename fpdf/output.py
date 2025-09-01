@@ -9,6 +9,7 @@ in non-backward-compatible ways.
 
 # pylint: disable=protected-access
 import logging
+import re
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from io import BytesIO
@@ -16,11 +17,12 @@ from io import BytesIO
 from fontTools import subset as ftsubset
 
 from .annotations import PDFAnnotation
-from .enums import PDFResourceType, PageLabelStyle, SignatureFlag
-from .enums import OutputIntentSubType
+from .drawing import PaintSoftMask, Transform
+from .enums import OutputIntentSubType, PageLabelStyle, PDFResourceType, SignatureFlag
 from .errors import FPDFException
-from .line_break import TotalPagesSubstitutionFragment
+from .font_type_3 import Type3Font
 from .image_datastructures import RasterImageInfo
+from .line_break import TotalPagesSubstitutionFragment
 from .outline import build_outline_objs
 from .sign import Signature, sign_content
 from .syntax import (
@@ -42,7 +44,7 @@ try:
 except ImportError:
     signer = None
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from .fpdf import FPDF
@@ -92,6 +94,95 @@ class CIDSystemInfo(PDFObject):
         self.registry = PDFString("Adobe", encrypt=True)
         self.ordering = PDFString("UCS", encrypt=True)
         self.supplement = 0
+
+
+class PDFType3Font(PDFObject):
+    def __init__(self, font3: "Type3Font"):
+        super().__init__()
+        self._font3 = font3
+        self.type = Name("Font")
+        self.name = Name(f"MPDFAA+{font3.base_font.name}")
+        self.subtype = Name("Type3")
+        self.font_b_box = (
+            f"[{self._font3.base_font.ttfont['head'].xMin * self._font3.scale:.0f}"
+            f" {self._font3.base_font.ttfont['head'].yMin * self._font3.scale:.0f}"
+            f" {self._font3.base_font.ttfont['head'].xMax * self._font3.scale:.0f}"
+            f" {self._font3.base_font.ttfont['head'].yMax * self._font3.scale:.0f}]"
+        )
+        self.font_matrix = "[0.001 0 0 0.001 0 0]"
+        self.first_char = min(g.unicode for g in font3.glyphs)
+        self.last_char = max(g.unicode for g in font3.glyphs)
+        self.resources = None
+        self.to_unicode = None
+
+    @property
+    def char_procs(self):
+        return pdf_dict(
+            {f"/{g.glyph_name}": f"{g.obj_id} 0 R" for g in self._font3.glyphs}
+        )
+
+    @property
+    def encoding(self):
+        return pdf_dict(
+            {
+                Name("/Type"): Name("/Encoding"),
+                Name("/Differences"): self.differences_table(),
+            }
+        )
+
+    @property
+    def widths(self):
+        sorted_glyphs = sorted(self._font3.glyphs, key=lambda glyph: glyph.unicode)
+        # Find the range of unicode values
+        min_unicode = sorted_glyphs[0].unicode
+        max_unicode = sorted_glyphs[-1].unicode
+
+        # Initialize widths array with zeros
+        widths = [0] * (max_unicode + 1 - min_unicode)
+
+        # Populate the widths array
+        for glyph in sorted_glyphs:
+            widths[glyph.unicode - min_unicode] = round(
+                glyph.glyph_width * self._font3.scale + 0.001
+            )
+        return pdf_list([str(glyph_width) for glyph_width in widths])
+
+    def generate_resources(
+        self, img_objs_per_index, gfxstate_objs_per_name, pattern_objs_per_name
+    ):
+        resources = "<<"
+        objects = " ".join(
+            f"/I{img} {img_objs_per_index[img].id} 0 R"
+            for img in self._font3.images_used
+        )
+        resources += f"/XObject <<{objects}>>" if len(objects) > 0 else ""
+
+        ext_g_state = " ".join(
+            f"/{name} {gfxstate_obj.id} 0 R"
+            for name, gfxstate_obj in gfxstate_objs_per_name.items()
+            if name in self._font3.graphics_style_used
+        )
+        resources += f"/ExtGState <<{ext_g_state}>>" if len(ext_g_state) > 0 else ""
+
+        pattern = " ".join(
+            f"/{name} {pattern.id} 0 R"
+            for name, pattern in pattern_objs_per_name.items()
+            if name in self._font3.patterns_used
+        )
+        resources += f"/Pattern <<{pattern}>>" if len(pattern) > 0 else ""
+
+        resources += ">>"
+        self.resources = resources
+
+    def differences_table(self):
+        sorted_glyphs = sorted(self._font3.glyphs, key=lambda glyph: glyph.unicode)
+        return (
+            "["
+            + "\n".join(
+                f"{glyph.unicode} /{glyph.glyph_name}" for glyph in sorted_glyphs
+            )
+            + "]"
+        )
 
 
 class PDFInfo(PDFObject):
@@ -526,23 +617,92 @@ class OutputIntentDictionary:
 class ResourceCatalog:
     "Manage the indexing of resources and association to the pages they are used"
 
+    GS_REGEX = re.compile(r"/(GS\d+) gs")
+    IMG_REGEX = re.compile(r"/I(\d+) Do")
+    PATTERN_FILL_REGEX = re.compile(r"/(P\d+)\s+scn")
+    PATTERN_STROKE_REGEX = re.compile(r"/(P\d+)\s+SCN")
+
     def __init__(self):
         self.resources = defaultdict(dict)
         self.resources_per_page = defaultdict(set)
+        self.graphics_styles = OrderedDict()
+        self.soft_mask_xobjects = []
+        self.last_reserved_object_id = 0
 
-    def add(self, resource_type: PDFResourceType, resource, page_number: int):
-        if resource_type in (PDFResourceType.PATTERN, PDFResourceType.SHADDING):
+    def add(self, resource_type: PDFResourceType, resource, page_number: Optional[int]):
+        if resource_type in (PDFResourceType.PATTERN, PDFResourceType.SHADING):
             registry = self.resources[resource_type]
+            prefix = self._get_prefix(resource_type)
+
             if resource not in registry:
-                registry[resource] = (
-                    f"{self._get_prefix(resource_type)}{len(registry) + 1}"
+                registry[resource] = f"{prefix}{len(registry) + 1}"
+            if page_number is not None:
+                self.resources_per_page[(page_number, resource_type)].add(
+                    registry[resource]
                 )
-            self.resources_per_page[(page_number, resource_type)].add(
-                registry[resource]
-            )
             return registry[resource]
+
         self.resources_per_page[(page_number, resource_type)].add(resource)
         return None
+
+    def register_graphics_style(self, style):
+        """
+        Graphics style can be added without associating to a page number right away,
+        like when rendering a svg image.
+        The method that adds image to the page will call the add method for the page association.
+        """
+        style_dict = style.serialize()
+        if not style_dict:  # empty style does not need an entry
+            return None
+
+        if style_dict not in self.graphics_styles:
+            name = Name(
+                f"{self._get_prefix(PDFResourceType.EXT_G_STATE)}{len(self.graphics_styles)}"
+            )
+            self.graphics_styles[style_dict] = name
+
+        return self.graphics_styles[style_dict]
+
+    def register_soft_mask(self, soft_mask: PaintSoftMask) -> int:
+        """Register a soft mask xobject and return its object id"""
+        self.last_reserved_object_id += 1
+        xobject = soft_mask_path_to_xobject(soft_mask, self)
+        xobject.id = self.last_reserved_object_id
+        self.soft_mask_xobjects.append(xobject)
+        return xobject.id
+
+    def scan_stream(self, rendered: str) -> list[tuple[PDFResourceType, str]]:
+        """Parse a content stream and return discovered resources"""
+        found = set()
+
+        for m in self.GS_REGEX.finditer(rendered):
+            found.add((PDFResourceType.EXT_G_STATE, m.group(1)))
+
+        for m in self.IMG_REGEX.finditer(rendered):
+            found.add((PDFResourceType.X_OBJECT, int(m.group(1))))
+
+        for m in self.PATTERN_FILL_REGEX.finditer(rendered):
+            found.add((PDFResourceType.PATTERN, m.group(1)))
+
+        for m in self.PATTERN_STROKE_REGEX.finditer(rendered):
+            found.add((PDFResourceType.PATTERN, m.group(1)))
+
+        return found
+
+    def index_stream_resources(self, rendered: str, page_number: int) -> None:
+        """
+        Scan a rendered content stream and register resources used on the given page.
+        Currently indexes:
+          - ExtGState invocations: '/GSn gs'
+          - Image XObjects: '/In Do'
+        """
+        for resource_type, resource in self.scan_stream(rendered):
+            if resource_type == PDFResourceType.PATTERN:
+                self.resources_per_page[(page_number, PDFResourceType.PATTERN)].add(
+                    resource
+                )
+            else:
+                self.add(resource_type, resource, page_number)
 
     def get_items(self, resource_type: PDFResourceType):
         return self.resources[resource_type].items()
@@ -559,9 +719,11 @@ class ResourceCatalog:
 
     @classmethod
     def _get_prefix(cls, resource_type: PDFResourceType):
+        if resource_type == PDFResourceType.EXT_G_STATE:
+            return "GS"
         if resource_type == PDFResourceType.PATTERN:
             return "P"
-        if resource_type == PDFResourceType.SHADDING:
+        if resource_type == PDFResourceType.SHADING:
             return "Sh"
         raise ValueError(f"No prefix for resource type {resource_type}")
 
@@ -573,7 +735,9 @@ class OutputProducer:
         self.fpdf = fpdf
         self.pdf_objs = []
         self.iccp_i_to_pdf_i = {}
-        self.obj_id = 0  # current PDF object number
+        self.obj_id = (
+            fpdf._resource_catalog.last_reserved_object_id
+        )  # current PDF object number
         # array of PDF object offsets in self.buffer, used to build the xref table:
         self.offsets = {}
         self.trace_labels_per_obj_id = {}
@@ -768,9 +932,67 @@ class OutputProducer:
                         sig_annotation_obj = annot_obj
         return sig_annotation_obj
 
-    def _add_fonts(self):
+    def _add_fonts(
+        self, image_objects_per_index, gfxstate_objs_per_name, pattern_objs_per_name
+    ):
         font_objs_per_index = {}
         for font in sorted(self.fpdf.fonts.values(), key=lambda font: font.i):
+
+            # type 3 font
+            if font.type == "TTF" and font.color_font:
+                if font.subset._next > 0xFF:
+                    raise FPDFException(
+                        "Type 3 fonts with color glyphs are not supported is more than 255 glyphs are rendered. "
+                        "Set FPDF.render_color_fonts=False or use less color glyphs."
+                    )
+                for glyph in font.color_font.glyphs:
+                    glyph.obj_id = self._add_pdf_obj(
+                        PDFContentStream(contents=glyph.glyph, compress=False), "fonts"
+                    )
+                bfChar = []
+
+                for glyph, code_mapped in font.subset.items():
+                    if len(glyph.unicode) == 0:
+                        continue
+                    bfChar.append(
+                        f'<{code_mapped:02X}> <{"".join(chr(code).encode("utf-16-be").hex().upper() for code in glyph.unicode)}>\n'
+                    )
+
+                to_unicode_obj = PDFContentStream(
+                    "/CIDInit /ProcSet findresource begin\n"
+                    "12 dict begin\n"
+                    "begincmap\n"
+                    "/CIDSystemInfo\n"
+                    "<</Registry (Adobe)\n"
+                    "/Ordering (UCS)\n"
+                    "/Supplement 0\n"
+                    ">> def\n"
+                    "/CMapName /Adobe-Identity-UCS def\n"
+                    "/CMapType 2 def\n"
+                    "1 begincodespacerange\n"
+                    "<00> <FF>\n"
+                    "endcodespacerange\n"
+                    f"{len(bfChar)} beginbfchar\n"
+                    f"{''.join(bfChar)}"
+                    "endbfchar\n"
+                    "endcmap\n"
+                    "CMapName currentdict /CMap defineresource pop\n"
+                    "end\n"
+                    "end"
+                )
+                self._add_pdf_obj(to_unicode_obj, "fonts")
+
+                t3_font_obj = PDFType3Font(font.color_font)
+                t3_font_obj.to_unicode = pdf_ref(to_unicode_obj.id)
+                t3_font_obj.generate_resources(
+                    image_objects_per_index,
+                    gfxstate_objs_per_name,
+                    pattern_objs_per_name,
+                )
+                self._add_pdf_obj(t3_font_obj, "fonts")
+                font_objs_per_index[font.i] = t3_font_obj
+                continue
+
             # Standard font
             if font.type == "core":
                 encoding = (
@@ -824,7 +1046,6 @@ class OutputProducer:
                     "SVG ",  # SVG table
                     "CPAL",  # Color Palette table
                     "COLR",  # Color table
-                    "fvar",  # Font Variations table
                 ]
                 subsetter = ftsubset.Subsetter(options)
                 subsetter.populate(glyphs=glyph_names)
@@ -1006,7 +1227,7 @@ class OutputProducer:
             decode=decode,
             decode_parms=decode_parms,
         )
-        self._add_pdf_obj(img_obj, "images")
+        info["obj_id"] = self._add_pdf_obj(img_obj, "images")
 
         # Soft mask
         if self.fpdf.allow_images_transparency and "smask" in info:
@@ -1035,18 +1256,26 @@ class OutputProducer:
 
     def _add_gfxstates(self):
         gfxstate_objs_per_name = OrderedDict()
-        for state_dict, name in self.fpdf._drawing_graphics_state_registry.items():
+        for state_dict, name in self.fpdf._resource_catalog.graphics_styles.items():
             gfxstate_obj = PDFExtGState(state_dict)
             self._add_pdf_obj(gfxstate_obj, "gfxstate")
             gfxstate_objs_per_name[name] = gfxstate_obj
         return gfxstate_objs_per_name
 
+    def _add_soft_masks(self, gfxstate_objs_per_name, pattern_objs_per_name):
+        """Append soft-mask Form XObjects after patterns exist so we can resolve /Pattern ids."""
+        for soft_mask in self.fpdf._resource_catalog.soft_mask_xobjects:
+            soft_mask.resources = soft_mask._path.get_resource_dictionary(
+                gfxstate_objs_per_name, pattern_objs_per_name
+            )
+            self.pdf_objs.append(soft_mask)
+
     def _add_shadings(self):
         shading_objs_per_name = OrderedDict()
         for shading, name in self.fpdf._resource_catalog.get_items(
-            PDFResourceType.SHADDING
+            PDFResourceType.SHADING
         ):
-            for function in shading.functions:
+            for function in shading.get_functions():
                 self._add_pdf_obj(function, "function")
             shading_obj = shading.get_shading_object()
             self._add_pdf_obj(shading_obj, "shading")
@@ -1060,14 +1289,25 @@ class OutputProducer:
         ):
             self._add_pdf_obj(pattern, "pattern")
             pattern_objs_per_name[name] = pattern
+            if pattern.get_apply_page_ctm():
+                pattern.set_matrix(
+                    pattern.get_matrix()
+                    @ Transform.translation(0, -self.fpdf.h)
+                    .scale(x=1, y=-1)
+                    .scale(self.fpdf.k)
+                )
+
         return pattern_objs_per_name
 
     def _insert_resources(self, page_objs):
-        font_objs_per_index = self._add_fonts()
         img_objs_per_index = self._add_images()
         gfxstate_objs_per_name = self._add_gfxstates()
-        shading_objs_per_name = self._add_shadings()
         pattern_objs_per_name = self._add_patterns()
+        font_objs_per_index = self._add_fonts(
+            img_objs_per_index, gfxstate_objs_per_name, pattern_objs_per_name
+        )
+        shading_objs_per_name = self._add_shadings()
+        self._add_soft_masks(gfxstate_objs_per_name, pattern_objs_per_name)
         # Insert /Resources dicts:
         if self.fpdf.single_resources_object:
             resources_dict_obj = self._add_resources_dict(
@@ -1104,7 +1344,7 @@ class OutputProducer:
                 page_shading_objs_per_name = {
                     shading_name: shading_objs_per_name[shading_name]
                     for shading_name in self.fpdf._resource_catalog.get_resources_per_page(
-                        page_number, PDFResourceType.SHADDING
+                        page_number, PDFResourceType.SHADING
                     )
                 }
                 page_pattern_objs_per_name = {
@@ -1446,3 +1686,14 @@ def _sizeof_fmt(num, suffix="B"):
             return f"{num:3.1f}{unit}{suffix}"
         num /= 1024
     return f"{num:.1f}Yi{suffix}"
+
+
+def soft_mask_path_to_xobject(path, resource_catalog: ResourceCatalog):
+    """Converts a PaintedSoftMask into a PDF XObject Form suitable for use as a soft mask."""
+    xobject = PDFContentStream(contents=path.render(resource_catalog))
+    xobject._path = path
+    xobject.type = Name("XObject")
+    xobject.subtype = Name("Form")
+    xobject.b_box = PDFArray(path.get_bounding_box())
+    xobject.group = "<</S /Transparency /CS /DeviceGray /I true /K false>>"
+    return xobject

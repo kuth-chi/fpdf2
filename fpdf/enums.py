@@ -4,6 +4,8 @@ from enum import Enum, Flag, IntEnum, IntFlag
 from sys import intern
 from typing import Optional, Tuple, Union
 
+from fpdf.drawing_primitives import convert_to_device_color
+
 from .syntax import Name, wrap_in_local_context
 
 
@@ -433,9 +435,6 @@ class TableBorderStyle:
 
     def _get_change_line_color_command(self, pdf=None):
         """Return list with string for the draw command to change color (empty if no change)"""
-        # pylint: disable=import-outside-toplevel,cyclic-import
-        from .drawing import convert_to_device_color
-
         if pdf is None:
             color = self.color
         else:
@@ -528,9 +527,6 @@ class TableCellStyle:
     @staticmethod
     def get_change_fill_color_command(color):
         """Return list with string for command to change device color (empty list if no color)"""
-        # pylint: disable=import-outside-toplevel,cyclic-import
-        from .drawing import convert_to_device_color
-
         return (
             []
             if color is None
@@ -1217,6 +1213,46 @@ class BlendMode(CoerciveEnum):
     """
 
 
+class CompositingOperation(CoerciveEnum):
+    "An enumeration of Porter-Duff compositing operations."
+
+    CLEAR = Name("Clear")
+    """ Draw nothing """
+
+    SOURCE = Name("Source")
+    """ Draw the source only """
+
+    DESTINATION = Name("Destination")
+    """ Draw the destination only """
+
+    SOURCE_OVER = Name("SourceOver")
+    """The source is drawn over the destination (backdrop)."""
+
+    DESTINATION_OVER = Name("DestinationOver")
+    """The destination (backdrop) is drawn over the source."""
+
+    SOURCE_IN = Name("SourceIn")
+    """Only the part of the source that overlaps with the destination is drawn. The rest is discarded."""
+
+    DESTINATION_IN = Name("DestinationIn")
+    """Only the part of the destination that overlaps with the source is drawn. The rest is discarded."""
+
+    SOURCE_OUT = Name("SourceOut")
+    """Only the part of the source that does not overlap the destination is drawn."""
+
+    DESTINATION_OUT = Name("DestinationOut")
+    """Only the part of the destination that does not overlap the source is drawn."""
+
+    SOURCE_ATOP = Name("SourceAtop")
+    """The part of the source that overlaps the destination is drawn over the destination. The rest of the source is discarded."""
+
+    DESTINATION_ATOP = Name("DestinationAtop")
+    """The part of the destination that overlaps the source is drawn over the source. The rest of the destination is discarded."""
+
+    XOR = Name("XOR")
+    """Only the parts of the source and destination that do not overlap are drawn."""
+
+
 class AnnotationFlag(CoerciveIntEnum):
     INVISIBLE = 1
     """
@@ -1439,6 +1475,7 @@ class PDFStyleKeys(Enum):
     STROKE_JOIN_STYLE = Name("LJ")
     STROKE_MITER_LIMIT = Name("ML")
     STROKE_DASH_PATTERN = Name("D")  # array of array, number, e.g. [[1 1] 0]
+    SOFT_MASK = Name("SMask")
 
 
 class Corner(CoerciveEnum):
@@ -1616,8 +1653,18 @@ class PDFResourceType(Enum):
     EXT_G_STATE = intern("ExtGState")
     COLOR_SPACE = intern("ColorSpace")
     PATTERN = intern("Pattern")
-    SHADDING = intern("Shading")
+    SHADING = intern("Shading")
     X_OBJECT = intern("XObject")
     FONT = intern("Font")
     PROC_SET = intern("ProcSet")
     PROPERTIES = intern("Properties")
+
+
+class GradientUnits(CoerciveEnum):
+    "Specifies the coordinate system for gradients."
+
+    OBJECT_BOUNDING_BOX = "objectBoundingBox"
+    " Coordinates are expressed as fractions of the painted object's bounding box (0..1 in each axis)."
+
+    USER_SPACE_ON_USE = "userSpaceOnUse"
+    " Coordinates are in the current page space."

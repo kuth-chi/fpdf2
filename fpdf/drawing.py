@@ -4,113 +4,60 @@ Vector drawing: managing colors, graphics states, paths, transforms...
 The contents of this module are internal to fpdf2, and not part of the public API.
 They may change at any time without prior warning or any deprecation period,
 in non-backward-compatible ways.
+
+Usage documentation at: <https://py-pdf.github.io/fpdf2/Drawing.html>
 """
 
-import decimal, math, re
-from copy import deepcopy
+import decimal
+import math
 from collections import OrderedDict
-
-from collections.abc import Sequence
 from contextlib import contextmanager
-from typing import Optional, NamedTuple, Union
+from copy import deepcopy
+from dataclasses import dataclass
+from typing import (
+    TYPE_CHECKING,
+    Generator,
+    NamedTuple,
+    Optional,
+    Protocol,
+    Union,
+    runtime_checkable,
+)
+
+from fpdf.drawing_primitives import (
+    DeviceCMYK,
+    DeviceGray,
+    DeviceRGB,
+    Number,
+    NumberClass,
+    Point,
+    Transform,
+    check_range,
+    color_from_hex_string,
+    force_nodocument,
+    number_to_str,
+)
 
 from .enums import (
     BlendMode,
     ClippingPathIntersectionRule,
+    CompositingOperation,
+    GradientUnits,
     IntersectionRule,
     PathPaintRule,
+    PDFResourceType,
+    PDFStyleKeys,
     StrokeCapStyle,
     StrokeJoinStyle,
-    PDFStyleKeys,
 )
+from .pattern import Gradient, Pattern
 from .syntax import Name, Raw
 from .util import escape_parens
 
-__pdoc__ = {"force_nodocument": False}
+from fontTools.pens.basePen import BasePen
 
-
-def force_nodocument(item):
-    """A decorator that forces pdoc not to document the decorated item (class or method)"""
-    __pdoc__[item.__qualname__] = False
-    return item
-
-
-@force_nodocument
-def force_document(item):
-    """A decorator that forces pdoc to document the decorated item (class or method)"""
-    __pdoc__[item.__qualname__] = True
-    return item
-
-
-# type alias:
-Number = Union[int, float, decimal.Decimal]
-NumberClass = (int, float, decimal.Decimal)
-
-
-WHITESPACE = frozenset("\0\t\n\f\r ")
-"""Characters PDF considers to be whitespace."""
-EOL_CHARS = frozenset("\n\r")
-"""Characters PDF considers to mark the end of a line."""
-DELIMITERS = frozenset("()<>[]{}/%")
-"""Special delimiter characters"""
-
-
-STR_ESC = re.compile(r"[\n\r\t\b\f()\\]")
-STR_ESC_MAP = {
-    "\n": r"\n",
-    "\r": r"\r",
-    "\t": r"\t",
-    "\b": r"\b",
-    "\f": r"\f",
-    "(": r"\(",
-    ")": r"\)",
-    "\\": r"\\",
-}
-
-
-class GraphicsStateDictRegistry(OrderedDict):
-    """
-    A container providing deduplication of graphics state dictionaries across a PDF.
-    """
-
-    def register_style(self, style: "GraphicsStyle"):
-        sdict = style.serialize()
-
-        # empty style does not need a dictionary
-        if not sdict:
-            return None
-
-        try:
-            return self[sdict]
-        except KeyError:
-            pass
-
-        name = Name(f"GS{len(self)}")
-        self[sdict] = name
-
-        return name
-
-
-def _check_range(value, minimum=0.0, maximum=1.0):
-    if not minimum <= value <= maximum:
-        raise ValueError(f"{value} not in range [{minimum}, {maximum}]")
-
-    return value
-
-
-def number_to_str(number):
-    """
-    Convert a decimal number to a minimal string representation (no trailing 0 or .).
-
-    Args:
-        number (Number): the number to be converted to a string.
-
-    Returns:
-        The number's string representation.
-    """
-    # this approach tries to produce minimal representations of floating point numbers
-    # but can also produce "-0".
-    return f"{number:.4f}".rstrip("0").rstrip(".")
+if TYPE_CHECKING:
+    from .output import ResourceCatalog
 
 
 # this maybe should live in fpdf.syntax
@@ -174,909 +121,229 @@ def render_pdf_primitive(primitive):
     return Raw(output)
 
 
-# We allow passing alpha in as None instead of a numeric quantity, which signals to the
-# rendering procedure not to emit an explicit alpha field for this graphics state,
-# causing it to be inherited from the parent.
+class GradientPaint:
+    """Fill/stroke paint using a gradient"""
 
-
-# this weird inheritance is used because for some reason normal NamedTuple usage doesn't
-# allow overriding __new__, even though it works just as expected this way.
-class DeviceRGB(
-    NamedTuple(
-        "DeviceRGB",
-        [("r", Number), ("g", Number), ("b", Number), ("a", Optional[Number])],
+    __slots__ = (
+        "gradient",
+        "units",
+        "gradient_transform",
+        "apply_page_ctm",
+        "skip_alpha",
     )
-):
-    """A class representing a PDF DeviceRGB color."""
 
-    # This follows a common PDF drawing operator convention where the operand is upcased
-    # to apply to stroke and downcased to apply to fill.
-
-    # This could be more manually specified by  `CS`/`cs` to set the color space(e.g. to
-    # `/DeviceRGB`) and `SC`/`sc` to set the color parameters. The documentation isn't
-    # perfectly clear on this front, but it appears that these cannot be set in the
-    # current graphics state dictionary and instead is set in the current page resource
-    # dictionary. fpdf appears to only generate a single resource dictionary for the
-    # entire document, and even if it created one per page, it would still be a lot
-    # clunkier to try to use that.
-
-    # Because PDF hates me, personally, the opacity of the drawing HAS to be specified
-    # in the current graphics state dictionary and does not exist as a standalone
-    # directive.
-    OPERATOR = "rg"
-    """The PDF drawing operator used to specify this type of color."""
-
-    def __new__(cls, r, g, b, a=None):
-        if a is not None:
-            _check_range(a)
-
-        return super().__new__(
-            cls, _check_range(r), _check_range(g), _check_range(b), a
-        )
-
-    @property
-    def colors(self):
-        "The color components as a tuple in order `(r, g, b)` with alpha omitted, in range 0-1."
-        return self[:-1]
-
-    @property
-    def colors255(self):
-        "The color components as a tuple in order `(r, g, b)` with alpha omitted, in range 0-255."
-        return tuple(255 * v for v in self.colors)
-
-    def serialize(self) -> str:
-        return " ".join(number_to_str(val) for val in self.colors) + f" {self.OPERATOR}"
-
-
-__pdoc__["DeviceRGB.OPERATOR"] = False
-__pdoc__["DeviceRGB.r"] = "The red color component. Must be in the interval [0, 1]."
-__pdoc__["DeviceRGB.g"] = "The green color component. Must be in the interval [0, 1]."
-__pdoc__["DeviceRGB.b"] = "The blue color component. Must be in the interval [0, 1]."
-__pdoc__[
-    "DeviceRGB.a"
-] = """
-The alpha color component (i.e. opacity). Must be `None` or in the interval [0, 1].
-
-An alpha value of 0 makes the color fully transparent, and a value of 1 makes it fully
-opaque. If `None`, the color will be interpreted as not specifying a particular
-transparency rather than specifying fully transparent or fully opaque.
-"""
-
-
-# this weird inheritance is used because for some reason normal NamedTuple usage doesn't
-# allow overriding __new__, even though it works just as expected this way.
-class DeviceGray(
-    NamedTuple(
-        "DeviceGray",
-        [("g", Number), ("a", Optional[Number])],
-    )
-):
-    """A class representing a PDF DeviceGray color."""
-
-    OPERATOR = "g"
-    """The PDF drawing operator used to specify this type of color."""
-
-    def __new__(cls, g, a=None):
-        if a is not None:
-            _check_range(a)
-
-        return super().__new__(cls, _check_range(g), a)
-
-    @property
-    def colors(self):
-        "The color components as a tuple in order (r, g, b) with alpha omitted, in range 0-1."
-        return self.g, self.g, self.g
-
-    @property
-    def colors255(self):
-        "The color components as a tuple in order `(r, g, b)` with alpha omitted, in range 0-255."
-        return tuple(255 * v for v in self.colors)
-
-    def serialize(self) -> str:
-        return f"{number_to_str(self.g)} {self.OPERATOR}"
-
-
-__pdoc__["DeviceGray.OPERATOR"] = False
-__pdoc__[
-    "DeviceGray.g"
-] = """
-The gray color component. Must be in the interval [0, 1].
-
-A value of 0 represents black and a value of 1 represents white.
-"""
-__pdoc__[
-    "DeviceGray.a"
-] = """
-The alpha color component (i.e. opacity). Must be `None` or in the interval [0, 1].
-
-An alpha value of 0 makes the color fully transparent, and a value of 1 makes it fully
-opaque. If `None`, the color will be interpreted as not specifying a particular
-transparency rather than specifying fully transparent or fully opaque.
-"""
-
-
-# this weird inheritance is used because for some reason normal NamedTuple usage doesn't
-# allow overriding __new__, even though it works just as expected this way.
-class DeviceCMYK(
-    NamedTuple(
-        "DeviceCMYK",
-        [
-            ("c", Number),
-            ("m", Number),
-            ("y", Number),
-            ("k", Number),
-            ("a", Optional[Number]),
-        ],
-    )
-):
-    """A class representing a PDF DeviceCMYK color."""
-
-    OPERATOR = "k"
-    """The PDF drawing operator used to specify this type of color."""
-
-    def __new__(cls, c, m, y, k, a=None):
-        if a is not None:
-            _check_range(a)
-
-        return super().__new__(
-            cls, _check_range(c), _check_range(m), _check_range(y), _check_range(k), a
-        )
-
-    @property
-    def colors(self):
-        "The color components as a tuple in order (c, m, y, k) with alpha omitted, in range 0-1."
-        return self[:-1]
-
-    def serialize(self) -> str:
-        return " ".join(number_to_str(val) for val in self.colors) + f" {self.OPERATOR}"
-
-
-__pdoc__["DeviceCMYK.OPERATOR"] = False
-__pdoc__["DeviceCMYK.c"] = "The cyan color component. Must be in the interval [0, 1]."
-__pdoc__["DeviceCMYK.m"] = (
-    "The magenta color component. Must be in the interval [0, 1]."
-)
-__pdoc__["DeviceCMYK.y"] = "The yellow color component. Must be in the interval [0, 1]."
-__pdoc__["DeviceCMYK.k"] = "The black color component. Must be in the interval [0, 1]."
-__pdoc__[
-    "DeviceCMYK.a"
-] = """
-The alpha color component (i.e. opacity). Must be `None` or in the interval [0, 1].
-
-An alpha value of 0 makes the color fully transparent, and a value of 1 makes it fully
-opaque. If `None`, the color will be interpreted as not specifying a particular
-transparency rather than specifying fully transparent or fully opaque.
-"""
-
-
-def rgb8(r, g, b, a=None):
-    """
-    Produce a DeviceRGB color from the given 8-bit RGB values.
-
-    Args:
-        r (Number): red color component. Must be in the interval [0, 255].
-        g (Number): green color component. Must be in the interval [0, 255].
-        b (Number): blue color component. Must be in the interval [0, 255].
-        a (Optional[Number]): alpha component. Must be `None` or in the interval
-            [0, 255]. 0 is fully transparent, 255 is fully opaque
-
-    Returns:
-        DeviceRGB color representation.
-
-    Raises:
-        ValueError: if any components are not in their valid interval.
-    """
-    if a is None:
-        if r == g == b:
-            return DeviceGray(r / 255.0)
-    else:
-        a /= 255.0
-
-    return DeviceRGB(r / 255.0, g / 255.0, b / 255.0, a)
-
-
-def gray8(g, a=None):
-    """
-    Produce a DeviceGray color from the given 8-bit gray value.
-
-    Args:
-        g (Number): gray color component. Must be in the interval [0, 255]. 0 is black,
-            255 is white.
-        a (Optional[Number]): alpha component. Must be `None` or in the interval
-            [0, 255]. 0 is fully transparent, 255 is fully opaque
-
-    Returns:
-        DeviceGray color representation.
-
-    Raises:
-        ValueError: if any components are not in their valid interval.
-    """
-    if a is not None:
-        a /= 255.0
-
-    return DeviceGray(g / 255.0, a)
-
-
-def convert_to_device_color(r, g=-1, b=-1):
-    if isinstance(r, (DeviceCMYK, DeviceGray, DeviceRGB)):
-        # Note: in this case, r is also a Sequence
-        return r
-    if isinstance(r, str) and r.startswith("#"):
-        return color_from_hex_string(r)
-    if isinstance(r, Sequence):
-        r, g, b = r
-    if (r, g, b) == (0, 0, 0) or g == -1:
-        return DeviceGray(r / 255)
-    return DeviceRGB(r / 255, g / 255, b / 255)
-
-
-def cmyk8(c, m, y, k, a=None):
-    """
-    Produce a DeviceCMYK color from the given 8-bit CMYK values.
-
-    Args:
-        c (Number): red color component. Must be in the interval [0, 255].
-        m (Number): green color component. Must be in the interval [0, 255].
-        y (Number): blue color component. Must be in the interval [0, 255].
-        k (Number): blue color component. Must be in the interval [0, 255].
-        a (Optional[Number]): alpha component. Must be `None` or in the interval
-            [0, 255]. 0 is fully transparent, 255 is fully opaque
-
-    Returns:
-        DeviceCMYK color representation.
-
-    Raises:
-        ValueError: if any components are not in their valid interval.
-    """
-    if a is not None:
-        a /= 255.0
-
-    return DeviceCMYK(c / 255.0, m / 255.0, y / 255.0, k / 255.0, a)
-
-
-def color_from_hex_string(hexstr):
-    """
-    Parse an RGB color from a css-style 8-bit hexadecimal color string.
-
-    Args:
-        hexstr (str): of the form `#RGB`, `#RGBA`, `#RRGGBB`, or `#RRGGBBAA` (case
-            insensitive). Must include the leading octothorp. Forms omitting the alpha
-            field are interpreted as not specifying the opacity, so it will not be
-            explicitly set.
-
-            An alpha value of `00` is fully transparent and `FF` is fully opaque.
-
-    Returns:
-        DeviceRGB representation of the color.
-    """
-    if not isinstance(hexstr, str):
-        raise TypeError(f"{hexstr} is not of type str")
-
-    if not hexstr.startswith("#"):
-        raise ValueError(f"{hexstr} does not start with #")
-
-    hlen = len(hexstr)
-
-    if hlen == 4:
-        return rgb8(*[int(char * 2, base=16) for char in hexstr[1:]], a=None)
-
-    if hlen == 5:
-        return rgb8(*[int(char * 2, base=16) for char in hexstr[1:]])
-
-    if hlen == 7:
-        return rgb8(
-            *[int(hexstr[idx : idx + 2], base=16) for idx in range(1, hlen, 2)], a=None
-        )
-
-    if hlen == 9:
-        return rgb8(*[int(hexstr[idx : idx + 2], base=16) for idx in range(1, hlen, 2)])
-
-    raise ValueError(f"{hexstr} could not be interpreted as a RGB(A) hex string")
-
-
-def color_from_rgb_string(rgbstr):
-    """
-    Parse an RGB color from a css-style rgb(R, G, B, A) color string.
-
-    Args:
-        rgbstr (str): of the form `rgb(R, G, B)` or `rgb(R, G, B, A)`.
-
-    Returns:
-        DeviceRGB representation of the color.
-    """
-    if not isinstance(rgbstr, str):
-        raise TypeError(f"{rgbstr} is not of type str")
-
-    rgbstr = rgbstr.replace(" ", "")
-
-    if not rgbstr.startswith("rgb(") or not rgbstr.endswith(")"):
-        raise ValueError(f"{rgbstr} does not follow the expected rgb(...) format")
-
-    rgbstr = rgbstr[4:-1]
-    colors = rgbstr.split(",")
-
-    if len(colors) == 3:
-        return rgb8(*[int(c) for c in colors], a=None)
-
-    if len(colors) == 4:
-        return rgb8(*[int(c) for c in colors])
-
-    raise ValueError(f"{rgbstr} could not be interpreted as a rgb(R, G, B[, A]) color")
-
-
-class Point(NamedTuple):
-    """
-    An x-y coordinate pair within the two-dimensional coordinate frame.
-    """
-
-    x: Number
-    """The abscissa of the point."""
-
-    y: Number
-    """The ordinate of the point."""
-
-    def render(self):
-        """Render the point to the string `"x y"` for emitting to a PDF."""
-
-        return f"{number_to_str(self.x)} {number_to_str(self.y)}"
-
-    def dot(self, other):
-        """
-        Compute the dot product of two points.
-
-        Args:
-            other (Point): the point with which to compute the dot product.
-
-        Returns:
-            The scalar result of the dot product computation.
-
-        Raises:
-            TypeError: if `other` is not a `Point`.
-        """
-        if not isinstance(other, Point):
-            raise TypeError(f"cannot dot with {other!r}")
-
-        return self.x * other.x + self.y * other.y
-
-    def angle(self, other):
-        """
-        Compute the angle between two points (interpreted as vectors from the origin).
-
-        The return value is in the interval (-pi, pi]. Sign is dependent on ordering,
-        with clockwise angle travel considered to be positive due to the orientation of
-        the coordinate frame basis vectors (i.e. the angle between `(1, 0)` and `(0, 1)`
-        is `+pi/2`, the angle between `(1, 0)` and `(0, -1)` is `-pi/2`, and the angle
-        between `(0, -1)` and `(1, 0)` is `+pi/2`).
-
-        Args:
-            other (Point): the point to compute the angle sweep toward.
-
-        Returns:
-            The scalar angle between the two points **in radians**.
-
-        Raises:
-            TypeError: if `other` is not a `Point`.
-        """
-
-        if not isinstance(other, Point):
-            raise TypeError(f"cannot compute angle with {other!r}")
-
-        signifier = (self.x * other.y) - (self.y * other.x)
-        sign = (signifier >= 0) - (signifier < 0)
-        return sign * math.acos(round(self.dot(other) / (self.mag() * other.mag()), 8))
-
-    def mag(self):
-        """
-        Compute the Cartesian distance from this point to the origin
-
-        This is the same as computing the magnitude of the vector represented by this
-        point.
-
-        Returns:
-            The scalar result of the distance computation.
-        """
-
-        return (self.x**2 + self.y**2) ** 0.5
-
-    @force_document
-    def __add__(self, other):
-        """
-        Produce the sum of two points.
-
-        Adding two points is the same as translating the source point by interpreting
-        the other point's x and y coordinates as distances.
-
-        Args:
-            other (Point): right-hand side of the infix addition operation
-
-        Returns:
-            A Point which is the sum of the two source points.
-        """
-        if isinstance(other, Point):
-            return Point(x=self.x + other.x, y=self.y + other.y)
-
-        return NotImplemented
-
-    @force_document
-    def __sub__(self, other):
-        """
-        Produce the difference between two points.
-
-        Unlike addition, this is not a commutative operation!
-
-        Args:
-            other (Point): right-hand side of the infix subtraction operation
-
-        Returns:
-            A Point which is the difference of the two source points.
-        """
-        if isinstance(other, Point):
-            return Point(x=self.x - other.x, y=self.y - other.y)
-
-        return NotImplemented
-
-    @force_document
-    def __neg__(self):
-        """
-        Produce a point by negating this point's coordinates.
-
-        Returns:
-            A Point whose coordinates are this points coordinates negated.
-        """
-        return Point(x=-self.x, y=-self.y)
-
-    @force_document
-    def __mul__(self, other):
-        """
-        Multiply a point by a scalar value.
-
-        Args:
-            other (Number): the scalar value by which to multiply the point's
-                coordinates.
-
-        Returns:
-            A Point whose coordinates are the result of the multiplication.
-        """
-        if isinstance(other, NumberClass):
-            return Point(self.x * other, self.y * other)
-
-        return NotImplemented
-
-    __rmul__ = __mul__
-
-    @force_document
-    def __truediv__(self, other):
-        """
-        Divide a point by a scalar value.
-
-        .. note::
-
-            Because division is not commutative, `Point / scalar` is implemented, but
-            `scalar / Point` is nonsensical and not implemented.
-
-        Args:
-            other (Number): the scalar value by which to divide the point's coordinates.
-
-        Returns:
-            A Point whose coordinates are the result of the division.
-        """
-        if isinstance(other, NumberClass):
-            return Point(self.x / other, self.y / other)
-
-        return NotImplemented
-
-    @force_document
-    def __floordiv__(self, other):
-        """
-        Divide a point by a scalar value using integer division.
-
-        .. note::
-
-            Because division is not commutative, `Point // scalar` is implemented, but
-            `scalar // Point` is nonsensical and not implemented.
-
-        Args:
-            other (Number): the scalar value by which to divide the point's coordinates.
-
-        Returns:
-            A Point whose coordinates are the result of the division.
-        """
-        if isinstance(other, NumberClass):
-            return Point(self.x // other, self.y // other)
-
-        return NotImplemented
-
-    # no __r(true|floor)div__ because division is not commutative!
-
-    @force_document
-    def __matmul__(self, other):
-        """
-        Transform a point with the given transform matrix.
-
-        .. note::
-            This operator is only implemented for Transforms. This transform is not
-            commutative, so `Point @ Transform` is implemented, but `Transform @ Point`
-            is not implemented (technically speaking, the current implementation is
-            commutative because of the way points and transforms are represented, but
-            if that representation were to change this operation could stop being
-            commutative)
-
-        Args:
-            other (Transform): the transform to apply to the point
-
-        Returns:
-            A Point whose coordinates are the result of applying the transform.
-        """
-        if isinstance(other, Transform):
-            return Point(
-                x=other.a * self.x + other.c * self.y + other.e,
-                y=other.b * self.x + other.d * self.y + other.f,
+    def __init__(
+        self,
+        gradient: "Gradient",
+        units: Union[GradientUnits, str] = GradientUnits.USER_SPACE_ON_USE,
+        gradient_transform: Optional["Transform"] = None,
+        apply_page_ctm: bool = True,
+    ):
+        self.gradient = gradient
+        self.units = GradientUnits.coerce(units)
+        self.gradient_transform = gradient_transform or Transform.identity()
+        self.apply_page_ctm = apply_page_ctm
+        self.skip_alpha = False
+
+    def _matrix_for(self, bbox: Optional["BoundingBox"]) -> "Transform":
+        """Return the final /Matrix for this gradient, given an optional bbox."""
+        if self.units == GradientUnits.OBJECT_BOUNDING_BOX:
+            if bbox is None:
+                raise RuntimeError(
+                    "GradientPaint requires bbox for objectBoundingBox units"
+                )
+            # Map [0,1]x[0,1] object space, then apply gradient_transform
+            matrix_bbox = Transform(
+                a=bbox.width, b=0, c=0, d=bbox.height, e=bbox.x0, f=bbox.y0
             )
+            return self.gradient_transform @ matrix_bbox
+        # userSpaceOnUse: only the provided gradient_transform
+        return self.gradient_transform
 
-        return NotImplemented
+    def _register_pattern(self, resource_catalog, matrix: "Transform") -> str:
+        """Create a Pattern with the given matrix, register shading+pattern, return pattern name."""
+        resource_catalog.add(PDFResourceType.SHADING, self.gradient, None)
+        pattern = Pattern(self.gradient).set_matrix(matrix)
+        pattern.set_apply_page_ctm(self.apply_page_ctm)
+        return resource_catalog.add(PDFResourceType.PATTERN, pattern, None)
 
-    def __str__(self):
-        return f"(x={number_to_str(self.x)}, y={number_to_str(self.y)})"
+    def emit_fill(self, resource_catalog, bbox: Optional["BoundingBox"] = None) -> str:
+        matrix = self._matrix_for(bbox)
+        pattern_name = self._register_pattern(resource_catalog, matrix)
+        return f"/Pattern cs /{pattern_name} scn"
+
+    def emit_stroke(
+        self, resource_catalog, bbox: Optional["BoundingBox"] = None
+    ) -> str:
+        matrix = self._matrix_for(bbox)
+        pattern_name = self._register_pattern(resource_catalog, matrix)
+        return f"/Pattern CS /{pattern_name} SCN"
+
+    def has_alpha(self) -> bool:
+        return self.gradient and self.gradient.has_alpha() and not self.skip_alpha
+
+    def _register_alpha_pattern(self, resource_catalog, matrix: "Transform") -> str:
+        alpha_shading = self.gradient.get_alpha_shading_object()
+        if alpha_shading is None:
+            raise RuntimeError("Alpha gradient requested but no alpha ramp found")
+        # Register the shading and wrap it into a Pattern using the same matrix
+        resource_catalog.add(PDFResourceType.SHADING, alpha_shading, None)
+        alpha_pattern = Pattern(alpha_shading).set_matrix(matrix)
+        alpha_pattern.set_apply_page_ctm(False)
+        return resource_catalog.add(PDFResourceType.PATTERN, alpha_pattern, None)
 
 
-class Transform(NamedTuple):
-    """
-    A representation of an affine transformation matrix for 2D shapes.
+class _AlphaGradientPaint(GradientPaint):
 
-    The actual matrix is:
+    def emit_fill(self, resource_catalog, bbox: Optional["BoundingBox"] = None) -> str:
+        matrix = self._matrix_for(bbox)
+        pattern_name = self._register_alpha_pattern(resource_catalog, matrix)
+        return f"/Pattern cs /{pattern_name} scn"
 
-    ```
-                        [ a b 0 ]
-    [x' y' 1] = [x y 1] [ c d 0 ]
-                        [ e f 1 ]
-    ```
+    def emit_stroke(
+        self, resource_catalog, bbox: Optional["BoundingBox"] = None
+    ) -> str:
+        matrix = self._matrix_for(bbox)
+        pattern_name = self._register_alpha_pattern(resource_catalog, matrix)
+        return f"/Pattern CS /{pattern_name} SCN"
 
-    Complex transformation operations can be composed via a sequence of simple
-    transformations by performing successive matrix multiplication of the simple
-    transformations.
+    def has_alpha(self) -> bool:
+        return False  # already on the alpha gradient, can't alpha the alpha
 
-    For example, scaling a set of points around a specific center point can be
-    represented by a translation-scale-translation sequence, where the first
-    translation translates the center to the origin, the scale transform scales the
-    points relative to the origin, and the second translation translates the points
-    back to the specified center point. Transform multiplication is performed using
-    python's dedicated matrix multiplication operator, `@`
 
-    The semantics of this representation mean composed transformations are specified
-    left-to-right in order of application (some other systems provide transposed
-    representations, in which case the application order is right-to-left).
+class BoundingBox(NamedTuple):
+    """Represents a bounding box, with utility methods for creating and manipulating them."""
 
-    For example, to rotate the square `(1,1) (1,3) (3,3) (3,1)` 45 degrees clockwise
-    about its center point (which is `(2,2)`) , the translate-rotate-translate
-    process described above may be applied:
-
-    ```python
-    rotate_centered = (
-        Transform.translation(-2, -2)
-        @ Transform.rotation_d(45)
-        @ Transform.translation(2, 2)
-    )
-    ```
-
-    Instances of this class provide a chaining API, so the above transform could also be
-    constructed as follows:
-
-    ```python
-    rotate_centered = Transform.translation(-2, -2).rotate_d(45).translate(2, 2)
-    ```
-
-    Or, because the particular operation of performing some transformations about a
-    specific point is pretty common,
-
-    ```python
-    rotate_centered = Transform.rotation_d(45).about(2, 2)
-    ```
-
-    By convention, this class provides class method constructors following noun-ish
-    naming (`translation`, `scaling`, `rotation`, `shearing`) and instance method
-    manipulations following verb-ish naming (`translate`, `scale`, `rotate`, `shear`).
-    """
-
-    a: Number
-    b: Number
-    c: Number
-    d: Number
-    e: Number
-    f: Number
-
-    # compact representation of an affine transformation matrix for 2D shapes.
-    # The actual matrix is:
-    #                     [ A B 0 ]
-    # [x' y' 1] = [x y 1] [ C D 0 ]
-    #                     [ E F 1 ]
-    # The identity transform is 1 0 0 1 0 0
+    x0: float
+    y0: float
+    x1: float
+    y1: float
 
     @classmethod
-    def identity(cls):
+    def empty(cls) -> "BoundingBox":
         """
-        Create a transform representing the identity transform.
+        Return an 'empty' bounding box with extreme values that collapse on merge.
+        """
+        return cls(float("inf"), float("inf"), float("-inf"), float("-inf"))
 
-        The identity transform is a no-op.
-        """
-        return cls(1, 0, 0, 1, 0, 0)
+    def is_valid(self) -> bool:
+        """Return True if the bounding box is not empty."""
+        return self.x0 <= self.x1 and self.y0 <= self.y1
 
     @classmethod
-    def translation(cls, x, y):
-        """
-        Create a transform that performs translation.
+    def from_points(cls, points: list[Point]) -> "BoundingBox":
+        """Given a list of points, create a bounding box that encloses them all."""
+        xs = [float(p.x) for p in points]
+        ys = [float(p.y) for p in points]
+        return cls(min(xs), min(ys), max(xs), max(ys))
 
-        Args:
-            x (Number): distance to translate points along the x (horizontal) axis.
-            y (Number): distance to translate points along the y (vertical) axis.
-
-        Returns:
-            A Transform representing the specified translation.
-        """
-
-        return cls(1, 0, 0, 1, x, y)
-
-    @classmethod
-    def scaling(cls, x, y=None):
-        """
-        Create a transform that performs scaling.
-
-        Args:
-            x (Number): scaling ratio in the x (horizontal) axis. A value of 1
-                results in no scale change in the x axis.
-            y (Number): optional scaling ratio in the y (vertical) axis. A value of 1
-                results in no scale change in the y axis. If this value is omitted, it
-                defaults to the value provided to the `x` argument.
-
-        Returns:
-            A Transform representing the specified scaling.
-        """
-        if y is None:
-            y = x
-
-        return cls(x, 0, 0, y, 0, 0)
-
-    @classmethod
-    def rotation(cls, theta):
-        """
-        Create a transform that performs rotation.
-
-        Args:
-            theta (Number): the angle **in radians** by which to rotate. Positive
-                values represent clockwise rotations.
-
-        Returns:
-            A Transform representing the specified rotation.
-
-        """
-        return cls(
-            math.cos(theta), math.sin(theta), -math.sin(theta), math.cos(theta), 0, 0
+    def merge(self, other: "BoundingBox") -> "BoundingBox":
+        """Expand this bounding box to include another one."""
+        if not self.is_valid():
+            return other
+        if not other.is_valid():
+            return self
+        return BoundingBox(
+            min(self.x0, other.x0),
+            min(self.y0, other.y0),
+            max(self.x1, other.x1),
+            max(self.y1, other.y1),
         )
 
-    @classmethod
-    def rotation_d(cls, theta_d):
+    def transformed(self, tf: Transform) -> "BoundingBox":
         """
-        Create a transform that performs rotation **in degrees**.
-
-        Args:
-            theta_d (Number): the angle **in degrees** by which to rotate. Positive
-                values represent clockwise rotations.
-
-        Returns:
-            A Transform representing the specified rotation.
-
+        Return a new bounding box resulting from applying a transform to this one.
         """
-        return cls.rotation(math.radians(theta_d))
+        corners = [
+            Point(self.x0, self.y0),
+            Point(self.x1, self.y0),
+            Point(self.x0, self.y1),
+            Point(self.x1, self.y1),
+        ]
+        transformed_points = [pt @ tf for pt in corners]
+        return BoundingBox.from_points(transformed_points)
 
-    @classmethod
-    def shearing(cls, x, y=None):
-        """
-        Create a transform that performs shearing (not of sheep).
+    def expanded(self, dx: float, dy: Optional[float] = None) -> "BoundingBox":
+        """Return a new bounding box expanded by the given amounts in each direction."""
+        if dy is None:
+            dy = dx
+        return BoundingBox(self.x0 - dx, self.y0 - dy, self.x1 + dx, self.y1 + dy)
 
-        Args:
-            x (Number): The amount to shear along the x (horizontal) axis.
-            y (Number): Optional amount to shear along the y (vertical) axis. If omitted,
-                this defaults to the value provided to the `x` argument.
+    def expanded_to_stroke(
+        self, style: "GraphicsStyle", row_norms: tuple[float, float] = (1.0, 1.0)
+    ) -> "BoundingBox":
+        """Expand this bbox to include stroke coverage, given a graphics style."""
 
-        Returns:
-            A Transform representing the specified shearing.
+        # 1) Is there any stroke to consider?
+        if not style.resolve_paint_rule() in (
+            PathPaintRule.STROKE,
+            PathPaintRule.STROKE_FILL_NONZERO,
+            PathPaintRule.STROKE_FILL_EVENODD,
+        ):
+            return self
 
-        """
-        if y is None:
-            y = x
-        return cls(1, y, x, 1, 0, 0)
+        # If stroke opacity resolves to 0, no visible stroke => no expansion
+        so = getattr(style, "stroke_opacity", GraphicsStyle.INHERIT)
+        if (so is not GraphicsStyle.INHERIT) and (so is not None):
+            try:
+                if float(so) <= 0.0:
+                    return self  # no visible stroke, don't expand
+            except (TypeError, ValueError):
+                pass
 
-    def translate(self, x, y):
-        """
-        Produce a transform by composing the current transform with a translation.
+        # 2) Effective stroke width (PDF default is 1 if unset/inherit)
+        w = (
+            1.00
+            if style.stroke_width is None or style.stroke_width is GraphicsStyle.INHERIT
+            else style.stroke_width
+        )
+        w = float(w)
+        if w == 0.0:
+            return self
+        r = 0.5 * w
 
-        .. note::
-            Transforms are immutable, so this returns a new transform rather than
-            mutating self.
+        # 3) Row norms from CTM to scale the half-stroke in X/Y
+        nx, ny = row_norms
+        return self.expanded(r * nx, r * ny)
 
-        Args:
-            x (Number): distance to translate points along the x (horizontal) axis.
-            y (Number): distance to translate points along the y (vertical) axis.
+    def to_tuple(self) -> tuple[float, float, float, float]:
+        """Convert bounding box to a 4-tuple."""
+        return (self.x0, self.y0, self.x1, self.y1)
 
-        Returns:
-            A Transform representing the composed transform.
-        """
-        return self @ Transform.translation(x, y)
+    @property
+    def width(self) -> float:
+        """Return the width of the bounding box."""
+        return self.x1 - self.x0
 
-    def scale(self, x, y=None):
-        """
-        Produce a transform by composing the current transform with a scaling.
+    @property
+    def height(self) -> float:
+        """Return the height of the bounding box."""
+        return self.y1 - self.y0
 
-        .. note::
-            Transforms are immutable, so this returns a new transform rather than
-            mutating self.
+    def __str__(self) -> str:
+        return f"BoundingBox({self.x0}, {self.y0}, {self.x1}, {self.y1})"
 
-        Args:
-            x (Number): scaling ratio in the x (horizontal) axis. A value of 1
-                results in no scale change in the x axis.
-            y (Number): optional scaling ratio in the y (vertical) axis. A value of 1
-                results in no scale change in the y axis. If this value is omitted, it
-                defaults to the value provided to the `x` argument.
-
-        Returns:
-            A Transform representing the composed transform.
-        """
-        return self @ Transform.scaling(x, y)
-
-    def rotate(self, theta):
-        """
-        Produce a transform by composing the current transform with a rotation.
-
-        .. note::
-            Transforms are immutable, so this returns a new transform rather than
-            mutating self.
-
-        Args:
-            theta (Number): the angle **in radians** by which to rotate. Positive
-                values represent clockwise rotations.
-
-        Returns:
-            A Transform representing the composed transform.
-        """
-        return self @ Transform.rotation(theta)
-
-    def rotate_d(self, theta_d):
-        """
-        Produce a transform by composing the current transform with a rotation
-        **in degrees**.
-
-        .. note::
-            Transforms are immutable, so this returns a new transform rather than
-            mutating self.
-
-        Args:
-            theta_d (Number): the angle **in degrees** by which to rotate. Positive
-                values represent clockwise rotations.
-
-        Returns:
-            A Transform representing the composed transform.
-        """
-        return self @ Transform.rotation_d(theta_d)
-
-    def shear(self, x, y=None):
-        """
-        Produce a transform by composing the current transform with a shearing.
-
-        .. note::
-            Transforms are immutable, so this returns a new transform rather than
-            mutating self.
-
-        Args:
-            x (Number): The amount to shear along the x (horizontal) axis.
-            y (Number): Optional amount to shear along the y (vertical) axis. If omitted,
-                this defaults to the value provided to the `x` argument.
-
-        Returns:
-            A Transform representing the composed transform.
-        """
-        return self @ Transform.shearing(x, y)
-
-    def about(self, x, y):
-        """
-        Bracket the given transform in a pair of translations to make it appear about a
-        point that isn't the origin.
-
-        This is a useful shorthand for performing a transform like a rotation around the
-        center point of an object that isn't centered at the origin.
-
-        .. note::
-            Transforms are immutable, so this returns a new transform rather than
-            mutating self.
-
-        Args:
-            x (Number): the point along the x (horizontal) axis about which to transform.
-            y (Number): the point along the y (vertical) axis about which to transform.
-
-        Returns:
-            A Transform representing the composed transform.
-        """
-        return Transform.translation(-x, -y) @ self @ Transform.translation(x, y)
-
-    @force_document
-    def __mul__(self, other):
-        """
-        Multiply the individual transform parameters by a scalar value.
-
-        Args:
-            other (Number): the scalar value by which to multiply the parameters
-
-        Returns:
-            A Transform with the modified parameters.
-        """
-        if isinstance(other, NumberClass):
-            return Transform(
-                a=self.a * other,
-                b=self.b * other,
-                c=self.c * other,
-                d=self.d * other,
-                e=self.e * other,
-                f=self.f * other,
-            )
-
-        return NotImplemented
-
-    # scalar multiplication is commutative
-    __rmul__ = __mul__
-
-    @force_document
-    def __matmul__(self, other):
-        """
-        Compose two transforms into a single transform.
-
-        Args:
-            other (Transform): the right-hand side transform of the infix operator.
-
-        Returns:
-            A Transform representing the composed transform.
-        """
-        if isinstance(other, Transform):
-            return self.__class__(
-                a=self.a * other.a + self.b * other.c,
-                b=self.a * other.b + self.b * other.d,
-                c=self.c * other.a + self.d * other.c,
-                d=self.c * other.b + self.d * other.d,
-                e=self.e * other.a + self.f * other.c + other.e,
-                f=self.e * other.b + self.f * other.d + other.f,
-            )
-
-        return NotImplemented
-
-    def render(self, last_item):
-        """
-        Render the transform to its PDF output representation.
-
-        Args:
-            last_item: the last path element this transform applies to
-
-        Returns:
-            A tuple of `(str, last_item)`. `last_item` is returned unchanged.
-        """
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, BoundingBox):
+            return False
+        tolerance = 1e-6
         return (
-            f"{number_to_str(self.a)} {number_to_str(self.b)} "
-            f"{number_to_str(self.c)} {number_to_str(self.d)} "
-            f"{number_to_str(self.e)} {number_to_str(self.f)} cm",
-            last_item,
+            abs(self.x0 - other.x0) < tolerance
+            and abs(self.y0 - other.y0) < tolerance
+            and abs(self.x1 - other.x1) < tolerance
+            and abs(self.y1 - other.y1) < tolerance
         )
 
-    def __str__(self):
-        return (
-            f"transform: ["
-            f"{number_to_str(self.a)} {number_to_str(self.b)} 0; "
-            f"{number_to_str(self.c)} {number_to_str(self.d)} 0; "
-            f"{number_to_str(self.e)} {number_to_str(self.f)} 1]"
+    def __hash__(self) -> int:
+        # Round to match the tolerance used in __eq__
+        return hash(
+            (
+                round(self.x0, 6),
+                round(self.y0, 6),
+                round(self.x1, 6),
+                round(self.y1, 6),
+            )
         )
-
-
-__pdoc__["Transform.a"] = False
-__pdoc__["Transform.b"] = False
-__pdoc__["Transform.c"] = False
-__pdoc__["Transform.d"] = False
-__pdoc__["Transform.e"] = False
-__pdoc__["Transform.f"] = False
 
 
 class GraphicsStyle:
@@ -1089,6 +356,24 @@ class GraphicsStyle:
     explicitly disabled style. An example of this is the fill/stroke color styles,
     which use None as hints to the auto paint style detection code.
     """
+
+    _PRIVATE_SLOTS = (
+        "_allow_transparency",
+        "_auto_close",
+        "_fill_color",
+        "_intersection_rule",
+        "_paint_rule",
+        "_stroke_color",
+        "_stroke_dash_pattern",
+        "_stroke_dash_phase",
+    )
+
+    __slots__ = _PRIVATE_SLOTS + tuple(
+        k.value
+        for k in PDFStyleKeys
+        # we do not store STROKE_DASH_PATTERN under its PDF key; it's in _stroke_dash_pattern
+        if k is not PDFStyleKeys.STROKE_DASH_PATTERN
+    )
 
     INHERIT = ...
     """Singleton specifying a style parameter should be inherited from the parent context."""
@@ -1111,6 +396,7 @@ class GraphicsStyle:
         "stroke_miter_limit",
         "stroke_dash_pattern",
         "stroke_dash_phase",
+        "soft_mask",
     )
     """An ordered collection of properties to use when merging two GraphicsStyles."""
 
@@ -1118,6 +404,7 @@ class GraphicsStyle:
         PDFStyleKeys.FILL_ALPHA.value,
         PDFStyleKeys.STROKE_ALPHA.value,
         PDFStyleKeys.BLEND_MODE.value,
+        PDFStyleKeys.SOFT_MASK.value,
     )
     """An ordered collection of attributes not to emit in no transparency mode."""
 
@@ -1141,7 +428,7 @@ class GraphicsStyle:
     """A dictionary for resolving `PathPaintRule.AUTO`"""
 
     @classmethod
-    def merge(cls, parent, child):
+    def merge(cls, parent: "GraphicsStyle", child: "GraphicsStyle") -> "GraphicsStyle":
         """
         Merge parent and child into a single GraphicsStyle.
 
@@ -1175,13 +462,18 @@ class GraphicsStyle:
         self.stroke_miter_limit = self.INHERIT
         self.stroke_dash_pattern = self.INHERIT
         self.stroke_dash_phase = self.INHERIT
+        self.soft_mask = self.INHERIT
 
     def __deepcopy__(self, memo):
-        copied = self.__class__()
-        for prop in self.MERGE_PROPERTIES:
-            setattr(copied, prop, getattr(self, prop))
-
-        return copied
+        cls = self.__class__
+        new = cls.__new__(cls)  # bypass __init__
+        # copy private slots directly
+        for s in cls._PRIVATE_SLOTS:
+            object.__setattr__(new, s, getattr(self, s, cls.INHERIT))
+        # copy PDF-exposed slots (BM, ca, CA, etc.)
+        for key in cls.PDF_STYLE_KEYS:
+            object.__setattr__(new, key, getattr(self, key, cls.INHERIT))
+        return new
 
     def __setattr__(self, name, value):
         if not hasattr(self.__class__, name):
@@ -1258,9 +550,9 @@ class GraphicsStyle:
         if isinstance(color, str):
             color = color_from_hex_string(color)
 
-        if isinstance(color, (DeviceRGB, DeviceGray, DeviceCMYK)):
+        if isinstance(color, (DeviceRGB, DeviceGray, DeviceCMYK, GradientPaint)):
             super().__setattr__("_fill_color", color)
-            if color.a is not None:
+            if getattr(color, "a", None) is not None:
                 self.fill_opacity = color.a
 
         elif (color is None) or (color is self.INHERIT):
@@ -1277,7 +569,7 @@ class GraphicsStyle:
     @fill_opacity.setter
     def fill_opacity(self, new):
         if new not in {None, self.INHERIT}:
-            _check_range(new)
+            check_range(new)
 
         super().__setattr__(PDFStyleKeys.FILL_ALPHA.value, new)
 
@@ -1296,9 +588,9 @@ class GraphicsStyle:
         if isinstance(color, str):
             color = color_from_hex_string(color)
 
-        if isinstance(color, (DeviceRGB, DeviceGray, DeviceCMYK)):
+        if isinstance(color, (DeviceRGB, DeviceGray, DeviceCMYK, GradientPaint)):
             super().__setattr__("_stroke_color", color)
-            if color.a is not None:
+            if getattr(color, "a", None) is not None:
                 self.stroke_opacity = color.a
             if self.stroke_width is self.INHERIT:
                 self.stroke_width = 1
@@ -1317,7 +609,7 @@ class GraphicsStyle:
     @stroke_opacity.setter
     def stroke_opacity(self, new):
         if new not in {None, self.INHERIT}:
-            _check_range(new)
+            check_range(new)
 
         super().__setattr__(PDFStyleKeys.STROKE_ALPHA.value, new)
 
@@ -1433,7 +725,17 @@ class GraphicsStyle:
 
         raise TypeError(f"{value} isn't a number or GraphicsStyle.INHERIT")
 
-    def serialize(self):
+    @property
+    def soft_mask(self):
+        return getattr(self, PDFStyleKeys.SOFT_MASK.value)
+
+    @soft_mask.setter
+    def soft_mask(self, value):
+        if value is self.INHERIT or isinstance(value, PaintSoftMask):
+            return super().__setattr__(PDFStyleKeys.SOFT_MASK.value, value)
+        raise TypeError(f"{value} isn't a PaintSoftMask or GraphicsStyle.INHERIT")
+
+    def serialize(self) -> Optional[Raw]:
         """
         Convert this style object to a PDF dictionary with appropriate style keys.
 
@@ -1471,12 +773,12 @@ class GraphicsStyle:
 
             return render_pdf_primitive(result)
 
-        # this signals to the GraphicsStateDictRegistry that there is nothing to
+        # this signals to the graphics state registry that there is nothing to
         # register. This is a success case.
         return None
 
     @force_nodocument
-    def resolve_paint_rule(self):
+    def resolve_paint_rule(self) -> PathPaintRule:
         """
         Resolve `PathPaintRule.AUTO` to a real paint rule based on this style.
 
@@ -1513,15 +815,33 @@ class GraphicsStyle:
         return rule
 
 
-def _render_move(pt):
+@runtime_checkable
+class Renderable(Protocol):
+    """
+    Structural type for things that can render themselves into PDF operators
+    and report a geometric bounding box.
+    """
+
+    def render(
+        self,
+        resource_registry: "ResourceCatalog",
+        style: GraphicsStyle,
+        last_item: "Renderable",
+        initial_point: Point,
+    ) -> tuple[str, "Renderable", Point]: ...
+
+    def bounding_box(self, start: Point) -> tuple[BoundingBox, Point]: ...
+
+
+def _render_move(pt: Point) -> str:
     return f"{pt.render()} m"
 
 
-def _render_line(pt):
+def _render_line(pt: Point) -> str:
     return f"{pt.render()} l"
 
 
-def _render_curve(ctrl1, ctrl2, end):
+def _render_curve(ctrl1: Point, ctrl2: Point, end: Point) -> str:
     return f"{ctrl1.render()} {ctrl2.render()} {end.render()} c"
 
 
@@ -1538,17 +858,28 @@ class Move(NamedTuple):
     """The point to which to move."""
 
     @property
-    def end_point(self):
+    def end_point(self) -> Point:
         """The end point of this path element."""
         return self.pt
 
+    # pylint: disable=unused-argument
+    def bounding_box(self, start) -> tuple[BoundingBox, Point]:
+        bbox = BoundingBox.empty()
+        return bbox, self.pt
+
     @force_nodocument
-    def render(self, gsd_registry, style, last_item, initial_point):
+    def render(
+        self,
+        resource_registry: "ResourceCatalog",
+        style: GraphicsStyle,
+        last_item: Renderable,
+        initial_point: Point,
+    ) -> tuple[str, Renderable, Point]:
         """
         Render this path element to its PDF representation.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -1557,19 +888,19 @@ class Move(NamedTuple):
         Returns:
             a tuple of `(str, new_last_item)`, where `new_last_item` is `self`
         """
-        # pylint: disable=unused-argument
         return _render_move(self.pt), self, self.pt
 
+    # pylint: disable=unused-argument
     @force_nodocument
     def render_debug(
-        self, gsd_registry, style, last_item, initial_point, debug_stream, pfx
+        self, resource_registry, style, last_item, initial_point, debug_stream, pfx
     ):
         """
         Render this path element to its PDF representation and produce debug
         information.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -1583,9 +914,8 @@ class Move(NamedTuple):
         Returns:
             The same tuple as `Move.render`.
         """
-        # pylint: disable=unused-argument
         rendered, resolved, initial_point = self.render(
-            gsd_registry, style, last_item, initial_point
+            resource_registry, style, last_item, initial_point
         )
         debug_stream.write(str(self) + "\n")
 
@@ -1605,13 +935,23 @@ class RelativeMove(NamedTuple):
     pt: Point
     """The offset by which to move."""
 
+    def bounding_box(self, start: Point) -> tuple[BoundingBox, Point]:
+        """RelativeMove doesn't draw anything, so it has no bounding box."""
+        return BoundingBox.empty(), start + self.pt
+
     @force_nodocument
-    def render(self, gsd_registry, style, last_item, initial_point):
+    def render(
+        self,
+        resource_registry: "ResourceCatalog",
+        style: GraphicsStyle,
+        last_item: Renderable,
+        initial_point: Point,
+    ) -> tuple[str, Renderable, Point]:
         """
         Render this path element to its PDF representation.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -1627,14 +967,14 @@ class RelativeMove(NamedTuple):
 
     @force_nodocument
     def render_debug(
-        self, gsd_registry, style, last_item, initial_point, debug_stream, pfx
+        self, resource_registry, style, last_item, initial_point, debug_stream, pfx
     ):
         """
         Render this path element to its PDF representation and produce debug
         information.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -1650,7 +990,7 @@ class RelativeMove(NamedTuple):
         """
         # pylint: disable=unused-argument
         rendered, resolved, initial_point = self.render(
-            gsd_registry, style, last_item, initial_point
+            resource_registry, style, last_item, initial_point
         )
         debug_stream.write(f"{self} resolved to {resolved}\n")
 
@@ -1671,17 +1011,27 @@ class Line(NamedTuple):
     """The point to which the line is drawn."""
 
     @property
-    def end_point(self):
+    def end_point(self) -> Point:
         """The end point of this path element."""
         return self.pt
 
+    def bounding_box(self, start: Point) -> tuple[BoundingBox, Point]:
+        """Compute the bounding box of a line from the start point to the end point."""
+        return BoundingBox.from_points([start, self.pt]), self.pt
+
     @force_nodocument
-    def render(self, gsd_registry, style, last_item, initial_point):
+    def render(
+        self,
+        resource_registry: "ResourceCatalog",
+        style: GraphicsStyle,
+        last_item: Renderable,
+        initial_point: Point,
+    ) -> tuple[str, Renderable, Point]:
         """
         Render this path element to its PDF representation.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -1695,14 +1045,14 @@ class Line(NamedTuple):
 
     @force_nodocument
     def render_debug(
-        self, gsd_registry, style, last_item, initial_point, debug_stream, pfx
+        self, resource_registry, style, last_item, initial_point, debug_stream, pfx
     ):
         """
         Render this path element to its PDF representation and produce debug
         information.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -1718,7 +1068,7 @@ class Line(NamedTuple):
         """
         # pylint: disable=unused-argument
         rendered, resolved, initial_point = self.render(
-            gsd_registry, style, last_item, initial_point
+            resource_registry, style, last_item, initial_point
         )
         debug_stream.write(str(self) + "\n")
 
@@ -1739,13 +1089,23 @@ class RelativeLine(NamedTuple):
     pt: Point
     """The endpoint of the line relative to the previous path element."""
 
+    def bounding_box(self, start: Point) -> tuple[BoundingBox, Point]:
+        """Compute the bounding box of a relative line from the start point to the new end point."""
+        return BoundingBox.from_points([start, start + self.pt]), start + self.pt
+
     @force_nodocument
-    def render(self, gsd_registry, style, last_item, initial_point):
+    def render(
+        self,
+        resource_registry: "ResourceCatalog",
+        style: GraphicsStyle,
+        last_item: Renderable,
+        initial_point: Point,
+    ) -> tuple[str, Renderable, Point]:
         """
         Render this path element to its PDF representation.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -1761,14 +1121,14 @@ class RelativeLine(NamedTuple):
 
     @force_nodocument
     def render_debug(
-        self, gsd_registry, style, last_item, initial_point, debug_stream, pfx
+        self, resource_registry, style, last_item, initial_point, debug_stream, pfx
     ):
         """
         Render this path element to its PDF representation and produce debug
         information.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -1784,7 +1144,7 @@ class RelativeLine(NamedTuple):
         """
         # pylint: disable=unused-argument
         rendered, resolved, initial_point = self.render(
-            gsd_registry, style, last_item, initial_point
+            resource_registry, style, last_item, initial_point
         )
         debug_stream.write(f"{self} resolved to {resolved}\n")
 
@@ -1801,13 +1161,24 @@ class HorizontalLine(NamedTuple):
     x: Number
     """The abscissa of the horizontal line's end point."""
 
+    def bounding_box(self, start: Point) -> tuple[BoundingBox, Point]:
+        """Compute the bounding box of a horizontal line from the start point to the new x."""
+        end = Point(float(self.x), start.y)
+        return BoundingBox.from_points([start, end]), end
+
     @force_nodocument
-    def render(self, gsd_registry, style, last_item, initial_point):
+    def render(
+        self,
+        resource_registry: "ResourceCatalog",
+        style: GraphicsStyle,
+        last_item: Renderable,
+        initial_point: Point,
+    ) -> tuple[str, Renderable, Point]:
         """
         Render this path element to its PDF representation.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -1823,14 +1194,14 @@ class HorizontalLine(NamedTuple):
 
     @force_nodocument
     def render_debug(
-        self, gsd_registry, style, last_item, initial_point, debug_stream, pfx
+        self, resource_registry, style, last_item, initial_point, debug_stream, pfx
     ):
         """
         Render this path element to its PDF representation and produce debug
         information.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -1846,7 +1217,7 @@ class HorizontalLine(NamedTuple):
         """
         # pylint: disable=unused-argument
         rendered, resolved, initial_point = self.render(
-            gsd_registry, style, last_item, initial_point
+            resource_registry, style, last_item, initial_point
         )
         debug_stream.write(f"{self} resolved to {resolved}\n")
 
@@ -1867,13 +1238,25 @@ class RelativeHorizontalLine(NamedTuple):
     previous path element.
     """
 
+    def bounding_box(self, start: Point) -> tuple[BoundingBox, Point]:
+        """Compute the bounding box of a relative horizontal line."""
+        end = Point(float(start.x) + float(self.x), start.y)
+        bbox = BoundingBox.from_points([start, end])
+        return bbox, end
+
     @force_nodocument
-    def render(self, gsd_registry, style, last_item, initial_point):
+    def render(
+        self,
+        resource_registry: "ResourceCatalog",
+        style: GraphicsStyle,
+        last_item: Renderable,
+        initial_point: Point,
+    ) -> tuple[str, Renderable, Point]:
         """
         Render this path element to its PDF representation.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -1889,14 +1272,14 @@ class RelativeHorizontalLine(NamedTuple):
 
     @force_nodocument
     def render_debug(
-        self, gsd_registry, style, last_item, initial_point, debug_stream, pfx
+        self, resource_registry, style, last_item, initial_point, debug_stream, pfx
     ):
         """
         Render this path element to its PDF representation and produce debug
         information.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -1912,7 +1295,7 @@ class RelativeHorizontalLine(NamedTuple):
         """
         # pylint: disable=unused-argument
         rendered, resolved, initial_point = self.render(
-            gsd_registry, style, last_item, initial_point
+            resource_registry, style, last_item, initial_point
         )
         debug_stream.write(f"{self} resolved to {resolved}\n")
 
@@ -1929,13 +1312,25 @@ class VerticalLine(NamedTuple):
     y: Number
     """The ordinate of the vertical line's end point."""
 
+    def bounding_box(self, start: Point) -> tuple[BoundingBox, Point]:
+        """Compute the bounding box of this vertical line."""
+        end = Point(start.x, float(self.y))
+        bbox = BoundingBox.from_points([start, end])
+        return bbox, end
+
     @force_nodocument
-    def render(self, gsd_registry, style, last_item, initial_point):
+    def render(
+        self,
+        resource_registry: "ResourceCatalog",
+        style: GraphicsStyle,
+        last_item: Renderable,
+        initial_point: Point,
+    ) -> tuple[str, Renderable, Point]:
         """
         Render this path element to its PDF representation.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -1946,19 +1341,19 @@ class VerticalLine(NamedTuple):
             `Line`.
         """
         # pylint: disable=unused-argument
-        end_point = Point(x=last_item.end_point.x, y=self.y)
+        end_point = Point(x=last_item.end_point.x, y=float(self.y))
         return _render_line(end_point), Line(end_point), initial_point
 
     @force_nodocument
     def render_debug(
-        self, gsd_registry, style, last_item, initial_point, debug_stream, pfx
+        self, resource_registry, style, last_item, initial_point, debug_stream, pfx
     ):
         """
         Render this path element to its PDF representation and produce debug
         information.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -1974,7 +1369,7 @@ class VerticalLine(NamedTuple):
         """
         # pylint: disable=unused-argument
         rendered, resolved, initial_point = self.render(
-            gsd_registry, style, last_item, initial_point
+            resource_registry, style, last_item, initial_point
         )
         debug_stream.write(f"{self} resolved to {resolved}\n")
 
@@ -1995,13 +1390,25 @@ class RelativeVerticalLine(NamedTuple):
     previous path element.
     """
 
+    def bounding_box(self, start: Point) -> tuple[BoundingBox, Point]:
+        """Compute the bounding box of this relative vertical line."""
+        end = Point(start.x, float(start.y) + float(self.y))
+        bbox = BoundingBox.from_points([start, end])
+        return bbox, end
+
     @force_nodocument
-    def render(self, gsd_registry, style, last_item, initial_point):
+    def render(
+        self,
+        resource_registry: "ResourceCatalog",
+        style: GraphicsStyle,
+        last_item: Renderable,
+        initial_point: Point,
+    ) -> tuple[str, Renderable, Point]:
         """
         Render this path element to its PDF representation.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -2015,16 +1422,17 @@ class RelativeVerticalLine(NamedTuple):
         end_point = Point(x=last_item.end_point.x, y=last_item.end_point.y + self.y)
         return _render_line(end_point), Line(end_point), initial_point
 
+    # pylint: disable=unused-argument
     @force_nodocument
     def render_debug(
-        self, gsd_registry, style, last_item, initial_point, debug_stream, pfx
+        self, resource_registry, style, last_item, initial_point, debug_stream, pfx
     ):
         """
         Render this path element to its PDF representation and produce debug
         information.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -2038,13 +1446,48 @@ class RelativeVerticalLine(NamedTuple):
         Returns:
             The same tuple as `RelativeVerticalLine.render`.
         """
-        # pylint: disable=unused-argument
         rendered, resolved, initial_point = self.render(
-            gsd_registry, style, last_item, initial_point
+            resource_registry, style, last_item, initial_point
         )
         debug_stream.write(f"{self} resolved to {resolved}\n")
 
         return rendered, resolved, initial_point
+
+
+def _eval_cubic_bezier_1d(
+    t: float, p0: float, p1: float, p2: float, p3: float
+) -> float:
+    """Cubic Bézier scalar evaluation at t ∈ [0,1]."""
+    u = 1 - t
+    return (
+        (u * u * u) * p0
+        + 3 * (u * u) * t * p1
+        + 3 * u * (t * t) * p2
+        + (t * t * t) * p3
+    )
+
+
+def _cubic_bezier_critical_ts_1d(
+    p0: float, p1: float, p2: float, p3: float, eps: float = 1e-12
+) -> list[float]:
+    """t ∈ (0,1) where d/dt of the cubic Bézier equals 0 (possible extrema)."""
+    a = -3 * p0 + 9 * p1 - 9 * p2 + 3 * p3
+    b = 6 * p0 - 12 * p1 + 6 * p2
+    c = -3 * p0 + 3 * p1
+    ts = []
+    if abs(a) < eps:
+        if abs(b) > eps:
+            t = -c / b
+            if 0 < t < 1:
+                ts.append(t)
+    else:
+        disc = b * b - 4 * a * c
+        if disc >= 0:
+            r = disc**0.5
+            for t in ((-b + r) / (2 * a), (-b - r) / (2 * a)):
+                if 0 < t < 1:
+                    ts.append(t)
+    return ts
 
 
 class BezierCurve(NamedTuple):
@@ -2065,17 +1508,39 @@ class BezierCurve(NamedTuple):
     """The curve's end point."""
 
     @property
-    def end_point(self):
+    def end_point(self) -> Point:
         """The end point of this path element."""
         return self.end
 
+    def bounding_box(self, start: Point) -> tuple[BoundingBox, Point]:
+        """Compute the bounding box of this cubic Bézier curve."""
+
+        # Evaluate all candidate t values (endpoints + extrema) for both axes
+        px = [start.x, self.c1.x, self.c2.x, self.end.x]
+        py = [start.y, self.c1.y, self.c2.y, self.end.y]
+
+        tx = [0, 1] + _cubic_bezier_critical_ts_1d(*px)
+        ty = [0, 1] + _cubic_bezier_critical_ts_1d(*py)
+
+        xs = [_eval_cubic_bezier_1d(t, *px) for t in tx]
+        ys = [_eval_cubic_bezier_1d(t, *py) for t in ty]
+
+        bbox = BoundingBox(min(xs), min(ys), max(xs), max(ys))
+        return bbox, self.end
+
     @force_nodocument
-    def render(self, gsd_registry, style, last_item, initial_point):
+    def render(
+        self,
+        resource_registry: "ResourceCatalog",
+        style: GraphicsStyle,
+        last_item: Renderable,
+        initial_point: Point,
+    ) -> tuple[str, Renderable, Point]:
         """
         Render this path element to its PDF representation.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -2089,14 +1554,14 @@ class BezierCurve(NamedTuple):
 
     @force_nodocument
     def render_debug(
-        self, gsd_registry, style, last_item, initial_point, debug_stream, pfx
+        self, resource_registry, style, last_item, initial_point, debug_stream, pfx
     ):
         """
         Render this path element to its PDF representation and produce debug
         information.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -2112,7 +1577,7 @@ class BezierCurve(NamedTuple):
         """
         # pylint: disable=unused-argument
         rendered, resolved, initial_point = self.render(
-            gsd_registry, style, last_item, initial_point
+            resource_registry, style, last_item, initial_point
         )
         debug_stream.write(str(self) + "\n")
 
@@ -2138,13 +1603,52 @@ class RelativeBezierCurve(NamedTuple):
     end: Point
     """The curve's end point relative to the end of the previous path element."""
 
+    def bounding_box(self, start: Point) -> tuple[BoundingBox, Point]:
+        """
+        Compute the bounding box of this relative cubic Bézier curve.
+
+        Args:
+            start (Point): The starting point of the curve (i.e., the end of the previous path element).
+
+        Returns:
+            A tuple containing:
+                - BoundingBox: the axis-aligned bounding box containing the entire curve.
+                - Point: the end point of the curve.
+        """
+        # Resolve absolute coordinates
+        p0 = start
+        p1 = start + self.c1
+        p2 = start + self.c2
+        p3 = start + self.end
+
+        tx = [0, 1] + _cubic_bezier_critical_ts_1d(p0.x, p1.x, p2.x, p3.x)
+        ty = [0, 1] + _cubic_bezier_critical_ts_1d(p0.y, p1.y, p2.y, p3.y)
+
+        xs = [
+            _eval_cubic_bezier_1d(t, float(p0.x), float(p1.x), float(p2.x), float(p3.x))
+            for t in tx
+        ]
+        ys = [
+            _eval_cubic_bezier_1d(t, float(p0.y), float(p1.y), float(p2.y), float(p3.y))
+            for t in ty
+        ]
+
+        bbox = BoundingBox(min(xs), min(ys), max(xs), max(ys))
+        return bbox, p3
+
     @force_nodocument
-    def render(self, gsd_registry, style, last_item, initial_point):
+    def render(
+        self,
+        resource_registry: "ResourceCatalog",
+        style: GraphicsStyle,
+        last_item: Renderable,
+        initial_point: Point,
+    ) -> tuple[str, Renderable, Point]:
         """
         Render this path element to its PDF representation.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -2169,14 +1673,14 @@ class RelativeBezierCurve(NamedTuple):
 
     @force_nodocument
     def render_debug(
-        self, gsd_registry, style, last_item, initial_point, debug_stream, pfx
+        self, resource_registry, style, last_item, initial_point, debug_stream, pfx
     ):
         """
         Render this path element to its PDF representation and produce debug
         information.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -2192,7 +1696,7 @@ class RelativeBezierCurve(NamedTuple):
         """
         # pylint: disable=unused-argument
         rendered, resolved, initial_point = self.render(
-            gsd_registry, style, last_item, initial_point
+            resource_registry, style, last_item, initial_point
         )
         debug_stream.write(f"{self} resolved to {resolved}\n")
 
@@ -2215,11 +1719,11 @@ class QuadraticBezierCurve(NamedTuple):
     """The curve's end point."""
 
     @property
-    def end_point(self):
+    def end_point(self) -> Point:
         """The end point of this path element."""
         return self.end
 
-    def to_cubic_curve(self, start_point):
+    def to_cubic_curve(self, start_point: Point) -> BezierCurve:
         ctrl = self.ctrl
         end = self.end
 
@@ -2234,13 +1738,24 @@ class QuadraticBezierCurve(NamedTuple):
 
         return BezierCurve(ctrl1, ctrl2, end)
 
+    def bounding_box(self, start: Point) -> tuple[BoundingBox, Point]:
+        """Compute the bounding box of this quadratic Bézier curve by converting it to a cubic Bézier."""
+        cubic = self.to_cubic_curve(start)
+        return cubic.bounding_box(start)
+
     @force_nodocument
-    def render(self, gsd_registry, style, last_item, initial_point):
+    def render(
+        self,
+        resource_registry: "ResourceCatalog",
+        style: GraphicsStyle,
+        last_item: Renderable,
+        initial_point: Point,
+    ) -> tuple[str, Renderable, Point]:
         """
         Render this path element to its PDF representation.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -2251,7 +1766,7 @@ class QuadraticBezierCurve(NamedTuple):
         """
         return (
             self.to_cubic_curve(last_item.end_point).render(
-                gsd_registry, style, last_item, initial_point
+                resource_registry, style, last_item, initial_point
             )[0],
             self,
             initial_point,
@@ -2259,14 +1774,14 @@ class QuadraticBezierCurve(NamedTuple):
 
     @force_nodocument
     def render_debug(
-        self, gsd_registry, style, last_item, initial_point, debug_stream, pfx
+        self, resource_registry, style, last_item, initial_point, debug_stream, pfx
     ):
         """
         Render this path element to its PDF representation and produce debug
         information.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -2282,7 +1797,7 @@ class QuadraticBezierCurve(NamedTuple):
         """
         # pylint: disable=unused-argument
         rendered, resolved, initial_point = self.render(
-            gsd_registry, style, last_item, initial_point
+            resource_registry, style, last_item, initial_point
         )
         debug_stream.write(
             f"{self} resolved to {self.to_cubic_curve(last_item.end_point)}\n"
@@ -2304,13 +1819,25 @@ class RelativeQuadraticBezierCurve(NamedTuple):
     end: Point
     """The curve's end point relative to the end of the previous path element."""
 
+    def bounding_box(self, start: Point) -> tuple[BoundingBox, Point]:
+        """Compute the bounding box of this relative quadratic Bézier curve."""
+        ctrl = start + self.ctrl
+        end = start + self.end
+        return QuadraticBezierCurve(ctrl=ctrl, end=end).bounding_box(start)
+
     @force_nodocument
-    def render(self, gsd_registry, style, last_item, initial_point):
+    def render(
+        self,
+        resource_registry: "ResourceCatalog",
+        style: GraphicsStyle,
+        last_item: Renderable,
+        initial_point: Point,
+    ) -> tuple[str, Renderable, Point]:
         """
         Render this path element to its PDF representation.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -2326,18 +1853,18 @@ class RelativeQuadraticBezierCurve(NamedTuple):
         end = last_point + self.end
 
         absolute = QuadraticBezierCurve(ctrl=ctrl, end=end)
-        return absolute.render(gsd_registry, style, last_item, initial_point)
+        return absolute.render(resource_registry, style, last_item, initial_point)
 
     @force_nodocument
     def render_debug(
-        self, gsd_registry, style, last_item, initial_point, debug_stream, pfx
+        self, resource_registry, style, last_item, initial_point, debug_stream, pfx
     ):
         """
         Render this path element to its PDF representation and produce debug
         information.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -2353,7 +1880,7 @@ class RelativeQuadraticBezierCurve(NamedTuple):
         """
         # pylint: disable=unused-argument
         rendered, resolved, initial_point = self.render(
-            gsd_registry, style, last_item, initial_point
+            resource_registry, style, last_item, initial_point
         )
         debug_stream.write(
             f"{self} resolved to {resolved} "
@@ -2388,7 +1915,9 @@ class Arc(NamedTuple):
 
     @staticmethod
     @force_nodocument
-    def subdivde_sweep(sweep_angle):
+    def subdivide_sweep(
+        sweep_angle: float,
+    ) -> Generator[tuple[Point, Point, Point], None, None]:
         """
         A generator that subdivides a swept angle into segments no larger than a quarter
         turn.
@@ -2403,7 +1932,7 @@ class Arc(NamedTuple):
         position.
 
         Args:
-            sweep_angle (Number): the angle to subdivide.
+            sweep_angle (float): the angle to subdivide.
 
         Yields:
             A tuple of (ctrl1, ctrl2, end) representing the control and end points of
@@ -2433,7 +1962,7 @@ class Arc(NamedTuple):
 
             sweep_left -= sweep_segment
 
-    def _approximate_arc(self, last_item):
+    def _approximate_arc(self, last_item: Renderable) -> list[BezierCurve]:
         """
         Approximate this arc with a sequence of `BezierCurve`.
 
@@ -2499,20 +2028,41 @@ class Arc(NamedTuple):
 
         curves = []
 
-        for ctrl1, ctrl2, end in self.subdivde_sweep(deltatheta):
+        for ctrl1, ctrl2, end in self.subdivide_sweep(deltatheta):
             curves.append(
                 BezierCurve(ctrl1 @ final_tf, ctrl2 @ final_tf, end @ final_tf)
             )
 
         return curves
 
+    def bounding_box(self, start: Point) -> tuple[BoundingBox, Point]:
+        """
+        Compute the bounding box of this arc by approximating it with a series of
+        Bezier curves and aggregating their bounding boxes.
+        """
+        bbox = BoundingBox.empty()
+        prev = Move(start)
+
+        for curve in self._approximate_arc(prev):
+            segment_bbox, _ = curve.bounding_box(prev.end_point)
+            bbox = bbox.merge(segment_bbox)
+            prev = curve
+
+        return bbox, self.end
+
     @force_nodocument
-    def render(self, gsd_registry, style, last_item, initial_point):
+    def render(
+        self,
+        resource_registry: "ResourceCatalog",
+        style: GraphicsStyle,
+        last_item: Renderable,
+        initial_point: Point,
+    ) -> tuple[str, Renderable, Point]:
         """
         Render this path element to its PDF representation.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -2525,11 +2075,11 @@ class Arc(NamedTuple):
         curves = self._approximate_arc(last_item)
 
         if not curves:
-            return "", last_item
+            return "", last_item, initial_point
 
         return (
             " ".join(
-                curve.render(gsd_registry, style, prev, initial_point)[0]
+                curve.render(resource_registry, style, prev, initial_point)[0]
                 for prev, curve in zip([last_item, *curves[:-1]], curves)
             ),
             curves[-1],
@@ -2538,14 +2088,14 @@ class Arc(NamedTuple):
 
     @force_nodocument
     def render_debug(
-        self, gsd_registry, style, last_item, initial_point, debug_stream, pfx
+        self, resource_registry, style, last_item, initial_point, debug_stream, pfx
     ):
         """
         Render this path element to its PDF representation and produce debug
         information.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -2564,7 +2114,7 @@ class Arc(NamedTuple):
         debug_stream.write(f"{self} resolved to:\n")
         if not curves:
             debug_stream.write(pfx + " └─ nothing\n")
-            return "", last_item
+            return "", last_item, initial_point
 
         previous = [last_item]
         for curve in curves[:-1]:
@@ -2574,7 +2124,7 @@ class Arc(NamedTuple):
 
         return (
             " ".join(
-                curve.render(gsd_registry, style, prev, initial_point)[0]
+                curve.render(resource_registry, style, prev, initial_point)[0]
                 for prev, curve in zip(previous, curves)
             ),
             curves[-1],
@@ -2605,13 +2155,31 @@ class RelativeArc(NamedTuple):
     end: Point
     """The end point of the arc relative to the end of the previous path element."""
 
+    def bounding_box(self, start: Point) -> tuple[BoundingBox, Point]:
+        """Compute the bounding box of the resolved arc from the given start point."""
+        end_point = start + self.end
+        arc = Arc(
+            radii=self.radii,
+            rotation=self.rotation,
+            large=self.large,
+            sweep=self.sweep,
+            end=end_point,
+        )
+        return arc.bounding_box(start)
+
     @force_nodocument
-    def render(self, gsd_registry, style, last_item, initial_point):
+    def render(
+        self,
+        resource_registry: "ResourceCatalog",
+        style: GraphicsStyle,
+        last_item: Renderable,
+        initial_point: Point,
+    ) -> tuple[str, Renderable, Point]:
         """
         Render this path element to its PDF representation.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -2627,18 +2195,18 @@ class RelativeArc(NamedTuple):
             self.large,
             self.sweep,
             last_item.end_point + self.end,
-        ).render(gsd_registry, style, last_item, initial_point)
+        ).render(resource_registry, style, last_item, initial_point)
 
     @force_nodocument
     def render_debug(
-        self, gsd_registry, style, last_item, initial_point, debug_stream, pfx
+        self, resource_registry, style, last_item, initial_point, debug_stream, pfx
     ):
         """
         Render this path element to its PDF representation and produce debug
         information.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -2661,7 +2229,9 @@ class RelativeArc(NamedTuple):
             self.large,
             self.sweep,
             last_item.end_point + self.end,
-        ).render_debug(gsd_registry, style, last_item, initial_point, debug_stream, pfx)
+        ).render_debug(
+            resource_registry, style, last_item, initial_point, debug_stream, pfx
+        )
 
 
 class Rectangle(NamedTuple):
@@ -2672,13 +2242,36 @@ class Rectangle(NamedTuple):
     size: Point
     """The width and height of the rectangle."""
 
+    # pylint: disable=unused-argument
+    def bounding_box(self, start=None) -> tuple[BoundingBox, Point]:
+        """Compute the bounding box of this rectangle."""
+        x0, y0 = self.org.x, self.org.y
+        x1 = float(x0) + float(self.size.x)
+        y1 = float(y0) + float(self.size.y)
+
+        bbox = BoundingBox.from_points(
+            [
+                Point(x0, y0),
+                Point(x1, y0),
+                Point(x0, y1),
+                Point(x1, y1),
+            ]
+        )
+        return bbox, self.org
+
     @force_nodocument
-    def render(self, gsd_registry, style, last_item, initial_point):
+    def render(
+        self,
+        resource_registry: "ResourceCatalog",
+        style: GraphicsStyle,
+        last_item: Renderable,
+        initial_point: Point,
+    ) -> tuple[str, Renderable, Point]:
         """
         Render this path element to its PDF representation.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -2688,7 +2281,6 @@ class Rectangle(NamedTuple):
             a tuple of `(str, new_last_item)`, where `new_last_item` is a `Line` back to
             the rectangle's origin.
         """
-        # pylint: disable=unused-argument
 
         return (
             f"{self.org.render()} {self.size.render()} re",
@@ -2698,14 +2290,14 @@ class Rectangle(NamedTuple):
 
     @force_nodocument
     def render_debug(
-        self, gsd_registry, style, last_item, initial_point, debug_stream, pfx
+        self, resource_registry, style, last_item, initial_point, debug_stream, pfx
     ):
         """
         Render this path element to its PDF representation and produce debug
         information.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -2719,9 +2311,8 @@ class Rectangle(NamedTuple):
         Returns:
             The same tuple as `Rectangle.render`.
         """
-        # pylint: disable=unused-argument
         rendered, resolved, initial_point = self.render(
-            gsd_registry, style, last_item, initial_point
+            resource_registry, style, last_item, initial_point
         )
         debug_stream.write(f"{self} resolved to {rendered}\n")
 
@@ -2742,7 +2333,7 @@ class RoundedRectangle(NamedTuple):
     corner_radii: Point
     """The x- and y-radius of the corners."""
 
-    def _decompose(self):
+    def _decompose(self) -> list[Renderable]:
         items = []
 
         if (self.size.x == 0) and (self.size.y == 0):
@@ -2783,13 +2374,33 @@ class RoundedRectangle(NamedTuple):
 
         return items
 
+    def bounding_box(self, start: Point) -> tuple[BoundingBox, Point]:
+        """
+        Compute the bounding box of this rounded rectangle by decomposing into primitives
+        and merging their individual bounding boxes.
+        """
+        bbox = BoundingBox.empty()
+        current_point = start
+
+        for item in self._decompose():
+            b, current_point = item.bounding_box(current_point)
+            bbox = bbox.merge(b)
+
+        return bbox, self.org
+
     @force_nodocument
-    def render(self, gsd_registry, style, last_item, initial_point):
+    def render(
+        self,
+        resource_registry: "ResourceCatalog",
+        style: GraphicsStyle,
+        last_item: Renderable,
+        initial_point: Point,
+    ) -> tuple[str, Renderable, Point]:
         """
         Render this path element to its PDF representation.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -2802,12 +2413,12 @@ class RoundedRectangle(NamedTuple):
         components = self._decompose()
 
         if not components:
-            return "", last_item
+            return "", last_item, initial_point
 
         render_list = []
         for item in components:
             rendered, last_item, initial_point = item.render(
-                gsd_registry, style, last_item, initial_point
+                resource_registry, style, last_item, initial_point
             )
             render_list.append(rendered)
 
@@ -2815,14 +2426,14 @@ class RoundedRectangle(NamedTuple):
 
     @force_nodocument
     def render_debug(
-        self, gsd_registry, style, last_item, initial_point, debug_stream, pfx
+        self, resource_registry, style, last_item, initial_point, debug_stream, pfx
     ):
         """
         Render this path element to its PDF representation and produce debug
         information.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -2841,18 +2452,18 @@ class RoundedRectangle(NamedTuple):
         debug_stream.write(f"{self} resolved to:\n")
         if not components:
             debug_stream.write(pfx + " └─ nothing\n")
-            return "", last_item
+            return "", last_item, initial_point
 
         render_list = []
         for item in components[:-1]:
             rendered, last_item, initial_point = item.render(
-                gsd_registry, style, last_item, initial_point
+                resource_registry, style, last_item, initial_point
             )
             debug_stream.write(pfx + f" ├─ {item}\n")
             render_list.append(rendered)
 
         rendered, last_item, initial_point = components[-1].render(
-            gsd_registry, style, last_item, initial_point
+            resource_registry, style, last_item, initial_point
         )
         debug_stream.write(pfx + f" └─ {components[-1]}\n")
         render_list.append(rendered)
@@ -2872,7 +2483,7 @@ class Ellipse(NamedTuple):
     center: Point
     """The abscissa and ordinate of the center of the ellipse"""
 
-    def _decompose(self):
+    def _decompose(self) -> list[Renderable]:
         items = []
 
         rx = abs(self.radii.x)
@@ -2893,13 +2504,33 @@ class Ellipse(NamedTuple):
 
         return items
 
+    def bounding_box(self, start: Point) -> tuple[BoundingBox, Point]:
+        """
+        Compute the bounding box of this ellipse by decomposing it and merging the bounding boxes
+        of its components.
+        """
+        bbox = BoundingBox.empty()
+        current_point = start
+
+        for item in self._decompose():
+            b, current_point = item.bounding_box(current_point)
+            bbox = bbox.merge(b)
+
+        return bbox, self.center
+
     @force_nodocument
-    def render(self, gsd_registry, style, last_item, initial_point):
+    def render(
+        self,
+        resource_registry: "ResourceCatalog",
+        style: GraphicsStyle,
+        last_item: Renderable,
+        initial_point: Point,
+    ) -> tuple[str, Renderable, Point]:
         """
         Render this path element to its PDF representation.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -2912,12 +2543,12 @@ class Ellipse(NamedTuple):
         components = self._decompose()
 
         if not components:
-            return "", last_item
+            return "", last_item, initial_point
 
         render_list = []
         for item in components:
             rendered, last_item, initial_point = item.render(
-                gsd_registry, style, last_item, initial_point
+                resource_registry, style, last_item, initial_point
             )
             render_list.append(rendered)
 
@@ -2925,14 +2556,14 @@ class Ellipse(NamedTuple):
 
     @force_nodocument
     def render_debug(
-        self, gsd_registry, style, last_item, initial_point, debug_stream, pfx
+        self, resource_registry, style, last_item, initial_point, debug_stream, pfx
     ):
         """
         Render this path element to its PDF representation and produce debug
         information.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -2951,18 +2582,18 @@ class Ellipse(NamedTuple):
         debug_stream.write(f"{self} resolved to:\n")
         if not components:
             debug_stream.write(pfx + " └─ nothing\n")
-            return "", last_item
+            return "", last_item, initial_point
 
         render_list = []
         for item in components[:-1]:
             rendered, last_item, initial_point = item.render(
-                gsd_registry, style, last_item, initial_point
+                resource_registry, style, last_item, initial_point
             )
             debug_stream.write(pfx + f" ├─ {item}\n")
             render_list.append(rendered)
 
         rendered, last_item, initial_point = components[-1].render(
-            gsd_registry, style, last_item, initial_point
+            resource_registry, style, last_item, initial_point
         )
         debug_stream.write(pfx + f" └─ {components[-1]}\n")
         render_list.append(rendered)
@@ -2977,13 +2608,24 @@ class ImplicitClose(NamedTuple):
     """
 
     # pylint: disable=no-self-use
+    def bounding_box(self, start: Point) -> tuple[BoundingBox, Point]:
+        """Return an empty bounding box; Close does not affect the geometry."""
+        return BoundingBox.empty(), start
+
+    # pylint: disable=no-self-use
     @force_nodocument
-    def render(self, gsd_registry, style, last_item, initial_point):
+    def render(
+        self,
+        resource_registry: "ResourceCatalog",
+        style: GraphicsStyle,
+        last_item: Renderable,
+        initial_point: Point,
+    ) -> tuple[str, Renderable, Point]:
         """
         Render this path element to its PDF representation.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -3001,14 +2643,14 @@ class ImplicitClose(NamedTuple):
 
     @force_nodocument
     def render_debug(
-        self, gsd_registry, style, last_item, initial_point, debug_stream, pfx
+        self, resource_registry, style, last_item, initial_point, debug_stream, pfx
     ):
         """
         Render this path element to its PDF representation and produce debug
         information.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -3024,7 +2666,7 @@ class ImplicitClose(NamedTuple):
         """
         # pylint: disable=unused-argument
         rendered, resolved, initial_point = self.render(
-            gsd_registry, style, last_item, initial_point
+            resource_registry, style, last_item, initial_point
         )
         debug_stream.write(f"{self} resolved to {rendered}\n")
 
@@ -3042,13 +2684,24 @@ class Close(NamedTuple):
     """
 
     # pylint: disable=no-self-use
+    def bounding_box(self, start: Point) -> tuple[BoundingBox, Point]:
+        """Return an empty bounding box; Close does not affect the geometry."""
+        return BoundingBox.empty(), start
+
+    # pylint: disable=no-self-use
     @force_nodocument
-    def render(self, gsd_registry, style, last_item, initial_point):
+    def render(
+        self,
+        resource_registry: "ResourceCatalog",
+        style: GraphicsStyle,
+        last_item: Renderable,
+        initial_point: Point,
+    ) -> tuple[str, Renderable, Point]:
         """
         Render this path element to its PDF representation.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -3063,14 +2716,14 @@ class Close(NamedTuple):
 
     @force_nodocument
     def render_debug(
-        self, gsd_registry, style, last_item, initial_point, debug_stream, pfx
+        self, resource_registry, style, last_item, initial_point, debug_stream, pfx
     ):
         """
         Render this path element to its PDF representation and produce debug
         information.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -3086,11 +2739,48 @@ class Close(NamedTuple):
         """
         # pylint: disable=unused-argument
         rendered, resolved, initial_point = self.render(
-            gsd_registry, style, last_item, initial_point
+            resource_registry, style, last_item, initial_point
         )
         debug_stream.write(str(self) + "\n")
 
         return rendered, resolved, initial_point
+
+
+if TYPE_CHECKING:
+    # Validate all path items conform to the Renderable protocol
+    move: Renderable = Move(pt=Point(0, 0))
+    relative_move: Renderable = RelativeMove(pt=Point(0, 0))
+    line: Renderable = Line(pt=Point(0, 0))
+    relative_line: Renderable = RelativeLine(pt=Point(0, 0))
+    horizontal_line: Renderable = HorizontalLine(x=0)
+    relative_horizontal_line: Renderable = RelativeHorizontalLine(x=0)
+    vertical_line: Renderable = VerticalLine(y=0)
+    relative_vertical_line: Renderable = RelativeVerticalLine(y=0)
+    bezier_curve: Renderable = BezierCurve(
+        c1=Point(0, 0), c2=Point(0, 0), end=Point(0, 0)
+    )
+    relative_bezier_curve: Renderable = RelativeBezierCurve(
+        c1=Point(0, 0), c2=Point(0, 0), end=Point(0, 0)
+    )
+    quadratic_bezier_curve: Renderable = QuadraticBezierCurve(
+        ctrl=Point(0, 0), end=Point(0, 0)
+    )
+    relative_quadratic_bezier_curve: Renderable = RelativeQuadraticBezierCurve(
+        ctrl=Point(0, 0), end=Point(0, 0)
+    )
+    arc: Renderable = Arc(
+        radii=Point(0, 0), rotation=0, large=False, sweep=False, end=Point(0, 0)
+    )
+    relative_arc: Renderable = RelativeArc(
+        radii=Point(0, 0), rotation=0, large=False, sweep=False, end=Point(0, 0)
+    )
+    rectangle: Renderable = Rectangle(org=Point(0, 0), size=Point(0, 0))
+    rounded_rectangle: Renderable = RoundedRectangle(
+        org=Point(0, 0), size=Point(0, 0), corner_radii=Point(0, 0)
+    )
+    ellipse: Renderable = Ellipse(radii=Point(0, 0), center=Point(0, 0))
+    implicit_close: Renderable = ImplicitClose()
+    close: Renderable = Close()
 
 
 class DrawingContext:
@@ -3102,10 +2792,16 @@ class DrawingContext:
     is correctly scaled).
     """
 
-    def __init__(self):
-        self._subitems = []
+    __slots__ = ("_subitems",)
 
-    def add_item(self, item, _copy=True):
+    def __init__(self):
+        self._subitems: list[Union[GraphicsContext, PaintedPath, PaintComposite]] = []
+
+    def add_item(
+        self,
+        item: Union["GraphicsContext", "PaintedPath", "PaintComposite"],
+        _copy: bool = True,
+    ) -> None:
         """
         Append an item to this drawing context
 
@@ -3117,7 +2813,7 @@ class DrawingContext:
                 caution.
         """
 
-        if not isinstance(item, (GraphicsContext, PaintedPath)):
+        if not isinstance(item, (GraphicsContext, PaintedPath, PaintComposite)):
             raise TypeError(f"{item} doesn't belong in a DrawingContext")
 
         if _copy:
@@ -3126,7 +2822,9 @@ class DrawingContext:
         self._subitems.append(item)
 
     @staticmethod
-    def _setup_render_prereqs(style, first_point, scale, height):
+    def _setup_render_prereqs(
+        style, first_point: Point, scale: float, height: float
+    ) -> tuple[list[str], GraphicsStyle, Renderable]:
         style.auto_close = True
         style.paint_rule = PathPaintRule.AUTO
         style.intersection_rule = IntersectionRule.NONZERO
@@ -3143,12 +2841,19 @@ class DrawingContext:
 
         return render_list, style, last_item
 
-    def render(self, gsd_registry, first_point, scale, height, starting_style):
+    def render(
+        self,
+        resource_registry: "ResourceCatalog",
+        first_point: Point,
+        scale: float,
+        height: float,
+        starting_style: GraphicsStyle,
+    ) -> str:
         """
         Render the drawing context to PDF format.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the parent document's graphics
+            resource_registry (ResourceCatalog): the parent document's graphics
                 state registry.
             first_point (Point): the starting point to use if the first path element is
                 a relative element.
@@ -3173,7 +2878,7 @@ class DrawingContext:
 
         for item in self._subitems:
             rendered, last_item, first_point = item.render(
-                gsd_registry, style, last_item, first_point
+                resource_registry, style, last_item, first_point
             )
             if rendered:
                 render_list.append(rendered)
@@ -3183,7 +2888,15 @@ class DrawingContext:
         if len(render_list) == 2:
             return ""
 
-        style_dict_name = gsd_registry.register_style(style)
+        if (
+            style.soft_mask
+            and style.soft_mask is not GraphicsStyle.INHERIT
+            and style.soft_mask.object_id == 0
+        ):
+            style.soft_mask.object_id = resource_registry.register_soft_mask(
+                style.soft_mask
+            )
+        style_dict_name = resource_registry.register_graphics_style(style)
         if style_dict_name is not None:
             render_list.insert(2, f"{render_pdf_primitive(style_dict_name)} gs")
             render_list.insert(
@@ -3197,13 +2910,19 @@ class DrawingContext:
         return " ".join(render_list)
 
     def render_debug(
-        self, gsd_registry, first_point, scale, height, starting_style, debug_stream
+        self,
+        resource_registry,
+        first_point,
+        scale,
+        height,
+        starting_style,
+        debug_stream,
     ):
         """
         Render the drawing context to PDF format.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the parent document's graphics
+            resource_registry (ResourceCatalog): the parent document's graphics
                 state registry.
             first_point (Point): the starting point to use if the first path element is
                 a relative element.
@@ -3229,7 +2948,7 @@ class DrawingContext:
         for child in self._subitems[:-1]:
             debug_stream.write(" ├─ ")
             rendered, last_item = child.render_debug(
-                gsd_registry, style, last_item, debug_stream, " │  "
+                resource_registry, style, last_item, debug_stream, " │  "
             )
             if rendered:
                 render_list.append(rendered)
@@ -3237,7 +2956,7 @@ class DrawingContext:
         if self._subitems:
             debug_stream.write(" └─ ")
             rendered, last_item, first_point = self._subitems[-1].render_debug(
-                gsd_registry, style, last_item, first_point, debug_stream, "    "
+                resource_registry, style, last_item, first_point, debug_stream, "    "
             )
             if rendered:
                 render_list.append(rendered)
@@ -3247,7 +2966,15 @@ class DrawingContext:
             if len(render_list) == 2:
                 return ""
 
-            style_dict_name = gsd_registry.register_style(style)
+            if (
+                style.soft_mask
+                and style.soft_mask is not GraphicsStyle.INHERIT
+                and style.soft_mask.object_id == 0
+            ):
+                style.soft_mask.object_id = resource_registry.register_soft_mask(
+                    style.soft_mask
+                )
+            style_dict_name = resource_registry.register_graphics_style(style)
             if style_dict_name is not None:
                 render_list.insert(2, f"{render_pdf_primitive(style_dict_name)} gs")
                 render_list.insert(
@@ -3273,14 +3000,22 @@ class PaintedPath:
     primitive path elements and `GraphicsContext`.
     """
 
-    def __init__(self, x=0, y=0):
-        self._root_graphics_context = GraphicsContext()
-        self._graphics_context = self._root_graphics_context
+    __slots__ = (
+        "_root_graphics_context",
+        "_graphics_context",
+        "_closed",
+        "_close_context",
+        "_starter_move",
+    )
 
-        self._closed = True
-        self._close_context = self._graphics_context
+    def __init__(self, x: float = 0, y: float = 0) -> None:
+        self._root_graphics_context: GraphicsContext = GraphicsContext()
+        self._graphics_context: GraphicsContext = self._root_graphics_context
 
-        self._starter_move = Move(Point(x, y))
+        self._closed: bool = True
+        self._close_context: GraphicsContext = self._graphics_context
+
+        self._starter_move: Renderable = Move(Point(x, y))
 
     def __deepcopy__(self, memo):
         # there's no real way to recover the matching current _graphics_context after
@@ -3298,35 +3033,35 @@ class PaintedPath:
         return copied
 
     @property
-    def style(self):
+    def style(self) -> GraphicsStyle:
         """The `GraphicsStyle` applied to all elements of this path."""
         return self._root_graphics_context.style
 
     @property
-    def transform(self):
+    def transform(self) -> Optional[Transform]:
         """The `Transform` that applies to all of the elements of this path."""
         return self._root_graphics_context.transform
 
     @transform.setter
-    def transform(self, tf):
+    def transform(self, tf: Transform) -> None:
         self._root_graphics_context.transform = tf
 
     @property
-    def auto_close(self):
+    def auto_close(self) -> bool:
         """If true, the path should automatically close itself before painting."""
         return self.style.auto_close
 
     @auto_close.setter
-    def auto_close(self, should):
+    def auto_close(self, should: bool) -> None:
         self.style.auto_close = should
 
     @property
-    def paint_rule(self):
+    def paint_rule(self) -> PathPaintRule:
         """Manually specify the `PathPaintRule` to use for rendering the path."""
         return self.style.paint_rule
 
     @paint_rule.setter
-    def paint_rule(self, style):
+    def paint_rule(self, style: PathPaintRule) -> None:
         self.style.paint_rule = style
 
     @property
@@ -3337,6 +3072,9 @@ class PaintedPath:
     @clipping_path.setter
     def clipping_path(self, new_clipath):
         self._root_graphics_context.clipping_path = new_clipath
+
+    def get_graphics_context(self):
+        return self._graphics_context
 
     @contextmanager
     def _new_graphics_context(self, _attach=True):
@@ -3479,8 +3217,8 @@ class PaintedPath:
         the path is being rendered, or from 0, 0 if it is the first item.
 
         Args:
-            x (Number): abscissa of the (sub)path starting point relative to the.
-            y (Number): ordinate of the (sub)path starting point relative to the.
+            x (Number): abscissa of the (sub)path starting point relative to the previous point.
+            y (Number): ordinate of the (sub)path starting point relative to the previous point.
         """
         self._insert_implicit_close_if_open()
         if self._starter_move is not None:
@@ -3788,8 +3526,22 @@ class PaintedPath:
             self._close_context = self._graphics_context
             self._closed = True
 
+    def bounding_box(
+        self, start: Point, expand_for_stroke=True
+    ) -> tuple[BoundingBox, Point]:
+        """Compute the bounding box of this painted path, including nested contexts and transformations."""
+        return self._root_graphics_context.bounding_box(
+            start, self.style, expand_for_stroke=expand_for_stroke
+        )
+
     def render(
-        self, gsd_registry, style, last_item, initial_point, debug_stream=None, pfx=None
+        self,
+        resource_registry,
+        style,
+        last_item,
+        initial_point,
+        debug_stream=None,
+        pfx=None,
     ):
         self._insert_implicit_close_if_open()
 
@@ -3798,24 +3550,22 @@ class PaintedPath:
             last_item,
             initial_point,
         ) = self._root_graphics_context.build_render_list(
-            gsd_registry, style, last_item, initial_point, debug_stream, pfx
+            resource_registry, style, last_item, initial_point, debug_stream, pfx
         )
 
         paint_rule = GraphicsStyle.merge(style, self.style).resolve_paint_rule()
-
         render_list.insert(-1, paint_rule.value)
-
         return " ".join(render_list), last_item, initial_point
 
     def render_debug(
-        self, gsd_registry, style, last_item, initial_point, debug_stream, pfx
+        self, resource_registry, style, last_item, initial_point, debug_stream, pfx
     ):
         """
         Render this path element to its PDF representation and produce debug
         information.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -3830,7 +3580,7 @@ class PaintedPath:
             The same tuple as `PaintedPath.render`.
         """
         return self.render(
-            gsd_registry, style, last_item, initial_point, debug_stream, pfx
+            resource_registry, style, last_item, initial_point, debug_stream, pfx
         )
 
 
@@ -3852,6 +3602,8 @@ class ClippingPath(PaintedPath):
         this warning is here.
     """
 
+    __slots__ = ()  # no new attributes; preserve slotted layout from PaintedPath
+
     # because clipping paths can be painted, we inherit from PaintedPath. However, when
     # setting the styling on the clipping path, those values will also be applied to
     # the PaintedPath the ClippingPath is applied to unless they are explicitly set for
@@ -3867,7 +3619,13 @@ class ClippingPath(PaintedPath):
         self.paint_rule = PathPaintRule.DONT_PAINT
 
     def render(
-        self, gsd_registry, style, last_item, initial_point, debug_stream=None, pfx=None
+        self,
+        resource_registry,
+        style,
+        last_item,
+        initial_point,
+        debug_stream=None,
+        pfx=None,
     ):
         # painting the clipping path outside of its root graphics context allows it to
         # be transformed without affecting the transform of the graphics context of the
@@ -3884,7 +3642,7 @@ class ClippingPath(PaintedPath):
             last_item,
             initial_point,
         ) = self._root_graphics_context.build_render_list(
-            gsd_registry,
+            resource_registry,
             style,
             last_item,
             initial_point,
@@ -3911,14 +3669,14 @@ class ClippingPath(PaintedPath):
         return " ".join(render_list), last_item, initial_point
 
     def render_debug(
-        self, gsd_registry, style, last_item, initial_point, debug_stream, pfx
+        self, resource_registry, style, last_item, initial_point, debug_stream, pfx
     ):
         """
         Render this path element to its PDF representation and produce debug
         information.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -3932,46 +3690,61 @@ class ClippingPath(PaintedPath):
             The same tuple as `ClippingPath.render`.
         """
         return self.render(
-            gsd_registry, style, last_item, initial_point, debug_stream, pfx
+            resource_registry, style, last_item, initial_point, debug_stream, pfx
         )
 
 
 class GraphicsContext:
-    def __init__(self):
-        self.style = GraphicsStyle()
-        self.path_items = []
+    """
+    Page-level container that collects drawable items and renders them into a PDF
+    content stream.
 
-        self._transform = None
-        self._clipping_path = None
+    Converts model coordinates to PDF user space by applying the provided
+    `scale` and a vertical flip so (0, 0) is the top-left of the page.
+
+    Wraps output in a saved graphics state (`q … Q`) and registers any
+    required resources (graphics state dictionaries, soft masks, dash pattern).
+
+    Child items are typically `GraphicsContext`, `PaintedPath`, or `PaintComposite`
+    objects added via `add_item()`. By default, items are deep-copied on insert to
+    avoid later mutations affecting the emitted stream.
+    """
+
+    __slots__ = ("style", "path_items", "_transform", "_clipping_path")
+
+    def __init__(self):
+        self.style: GraphicsStyle = GraphicsStyle()
+        self.path_items: list[Renderable] = []
+
+        self._transform: Optional[Transform] = None
+        self._clipping_path: Optional[ClippingPath] = None
 
     def __deepcopy__(self, memo):
         copied = self.__class__()
         copied.style = deepcopy(self.style, memo)
         copied.path_items = deepcopy(self.path_items, memo)
-
         copied._transform = deepcopy(self.transform, memo)
         copied._clipping_path = deepcopy(self.clipping_path, memo)
-
         return copied
 
     @property
-    def transform(self):
+    def transform(self) -> Optional[Transform]:
         return self._transform
 
     @transform.setter
-    def transform(self, tf):
+    def transform(self, tf: Transform) -> None:
         self._transform = tf
 
     @property
-    def clipping_path(self):
+    def clipping_path(self) -> Optional[ClippingPath]:
         """The `ClippingPath` for this graphics context."""
         return self._clipping_path
 
     @clipping_path.setter
-    def clipping_path(self, new_clipath):
+    def clipping_path(self, new_clipath: ClippingPath) -> None:
         self._clipping_path = new_clipath
 
-    def add_item(self, item, _copy=True):
+    def add_item(self, item: Renderable, _copy: bool = True) -> None:
         """
         Add a path element to this graphics context.
 
@@ -3988,23 +3761,23 @@ class GraphicsContext:
 
         self.path_items.append(item)
 
-    def remove_last_item(self):
+    def remove_last_item(self) -> None:
         del self.path_items[-1]
 
-    def merge(self, other_context):
+    def merge(self, other_context: "GraphicsContext") -> None:
         """Copy another `GraphicsContext`'s path items into this one."""
         self.path_items.extend(other_context.path_items)
 
     @force_nodocument
     def build_render_list(
         self,
-        gsd_registry,
-        style,
-        last_item,
-        initial_point,
+        resource_registry: "ResourceCatalog",
+        style: GraphicsStyle,
+        last_item: Renderable,
+        initial_point: Point,
         debug_stream=None,
-        pfx=None,
-        _push_stack=True,
+        pfx: Optional[str] = None,
+        _push_stack: bool = True,
     ):
         """
         Build a list composed of all all the individual elements rendered.
@@ -4015,7 +3788,7 @@ class GraphicsContext:
         string.
 
         Args:
-            gsd_registry (GraphicsStateDictRegistry): the owner's graphics state
+            resource_registry (ResourceCatalog): the owner's graphics state
                 dictionary registry.
             style (GraphicsStyle): the current resolved graphics style
             last_item: the previous path element.
@@ -4065,7 +3838,7 @@ class GraphicsContext:
                 else:
                     debug_stream.write("\n")
 
-            NO_EMIT_SET = {None, merged_style.INHERIT}
+            NO_EMIT_SET = (None, merged_style.INHERIT)
 
             emit_style = self.style
             if merged_style.allow_transparency != self.style.allow_transparency:
@@ -4078,19 +3851,92 @@ class GraphicsContext:
             # drawing context.
             dash_pattern = merged_style.stroke_dash_pattern
             dash_phase = merged_style.stroke_dash_phase
-            if (dash_pattern != style.stroke_dash_pattern) or (
-                dash_phase != style.stroke_dash_phase
+            emit_dash = None
+            if (
+                dash_pattern != style.stroke_dash_pattern
+                or dash_phase != style.stroke_dash_phase
             ):
                 if emit_style is self.style:
                     emit_style = deepcopy(emit_style)
                 emit_style.stroke_dash_pattern = dash_pattern
                 emit_style.stroke_dash_phase = dash_phase
-
                 emit_dash = (dash_pattern, dash_phase)
-            else:
-                emit_dash = None
 
-            style_dict_name = gsd_registry.register_style(emit_style)
+            if (
+                emit_style.soft_mask
+                and emit_style.soft_mask is not GraphicsStyle.INHERIT
+                and emit_style.soft_mask.object_id == 0
+            ):
+                emit_style.soft_mask.object_id = resource_registry.register_soft_mask(
+                    emit_style.soft_mask
+                )
+            # ---- If fill/stroke use a GradientPaint with alpha, synthesize a soft mask now
+            # Compute bbox once so mask and color share the same mapping
+            bbox_for_units = self.bounding_box(
+                initial_point, style=self.style, expand_for_stroke=False
+            )[0]
+
+            def _attach_alpha_mask_if_needed(paint_obj: GradientPaint):
+                if not isinstance(paint_obj, GradientPaint):
+                    return
+                if not paint_obj.has_alpha():
+                    return
+                # bbox in content space (shared by color & mask)
+                bbox_for_units = self.bounding_box(
+                    initial_point,
+                    style=self.style,
+                    expand_for_stroke=False,
+                    transformed=False,
+                )[0]
+                # rectangular mask covering the painted area
+                mask_rect = PaintedPath()
+                mask_rect.rectangle(
+                    bbox_for_units.x0,
+                    bbox_for_units.y0,
+                    bbox_for_units.width,
+                    bbox_for_units.height,
+                )
+                # paint that rectangle with the grayscale alpha gradient
+                alpha_paint = _AlphaGradientPaint(
+                    paint_obj.gradient,
+                    paint_obj.units,
+                    gradient_transform=paint_obj.gradient_transform,
+                )
+                alpha_paint.apply_page_ctm = paint_obj.apply_page_ctm
+                mask_rect.style.fill_color = alpha_paint
+                mask_rect.style.stroke_color = None
+                mask_rect.transform = Transform.identity()
+                mask_rect.style.paint_rule = PathPaintRule.FILL_NONZERO
+                # use luminosity so gray intensity drives coverage
+                sm = PaintSoftMask(
+                    mask_rect,
+                    invert=False,
+                    use_luminosity=True,
+                    matrix=paint_obj.gradient_transform,
+                )
+
+                nonlocal emit_style
+                if emit_style is self.style:
+                    emit_style = deepcopy(self.style)
+                emit_style.soft_mask = sm
+                emit_style.soft_mask.object_id = resource_registry.register_soft_mask(
+                    emit_style.soft_mask
+                )
+                if emit_style.allow_transparency is GraphicsStyle.INHERIT:
+                    emit_style.allow_transparency = True
+
+            # Decide whether to attach a soft mask from fill or stroke gradient alpha.
+            # Priority: fill first (most common), otherwise stroke.
+            if isinstance(emit_style.fill_color, GradientPaint) and (
+                emit_style.soft_mask in (None, GraphicsStyle.INHERIT)
+            ):
+                _attach_alpha_mask_if_needed(self.style.fill_color)
+            elif isinstance(emit_style.stroke_color, GradientPaint) and (
+                emit_style.soft_mask in (None, GraphicsStyle.INHERIT)
+            ):
+                _attach_alpha_mask_if_needed(self.style.stroke_color)
+
+            style_dict_name = resource_registry.register_graphics_style(emit_style)
 
             if style_dict_name is not None:
                 render_list.append(f"{render_pdf_primitive(style_dict_name)} gs")
@@ -4101,10 +3947,20 @@ class GraphicsContext:
             stroke_color = self.style.stroke_color
 
             if fill_color not in NO_EMIT_SET:
-                render_list.append(fill_color.serialize().lower())
+                if isinstance(fill_color, GradientPaint):
+                    render_list.append(
+                        fill_color.emit_fill(resource_registry, bbox_for_units)
+                    )
+                else:
+                    render_list.append(fill_color.serialize().lower())
 
             if stroke_color not in NO_EMIT_SET:
-                render_list.append(stroke_color.serialize().upper())
+                if isinstance(stroke_color, GradientPaint):
+                    render_list.append(
+                        stroke_color.emit_stroke(resource_registry, bbox_for_units)
+                    )
+                else:
+                    render_list.append(stroke_color.serialize().upper())
 
             if emit_dash is not None:
                 render_list.append(
@@ -4116,7 +3972,7 @@ class GraphicsContext:
                 if self.clipping_path is not None:
                     debug_stream.write(pfx + " ├─ ")
                     rendered_cpath, _, __ = self.clipping_path.render_debug(
-                        gsd_registry,
+                        resource_registry,
                         merged_style,
                         last_item,
                         initial_point,
@@ -4129,7 +3985,7 @@ class GraphicsContext:
                 for item in self.path_items[:-1]:
                     debug_stream.write(pfx + " ├─ ")
                     rendered, last_item, initial_point = item.render_debug(
-                        gsd_registry,
+                        resource_registry,
                         merged_style,
                         last_item,
                         initial_point,
@@ -4142,7 +3998,7 @@ class GraphicsContext:
 
                 debug_stream.write(pfx + " └─ ")
                 rendered, last_item, initial_point = self.path_items[-1].render_debug(
-                    gsd_registry,
+                    resource_registry,
                     merged_style,
                     last_item,
                     initial_point,
@@ -4156,14 +4012,14 @@ class GraphicsContext:
             else:
                 if self.clipping_path is not None:
                     rendered_cpath, _, __ = self.clipping_path.render(
-                        gsd_registry, merged_style, last_item, initial_point
+                        resource_registry, merged_style, last_item, initial_point
                     )
                     if rendered_cpath:
                         render_list.append(rendered_cpath)
 
                 for item in self.path_items:
                     rendered, last_item, initial_point = item.render(
-                        gsd_registry, merged_style, last_item, initial_point
+                        resource_registry, merged_style, last_item, initial_point
                     )
 
                     if rendered:
@@ -4179,18 +4035,83 @@ class GraphicsContext:
 
         return render_list, last_item, initial_point
 
+    def bounding_box(
+        self,
+        start: Point,
+        style: Optional[GraphicsStyle] = None,
+        expand_for_stroke: bool = True,
+        transformed: bool = True,
+    ) -> tuple[BoundingBox, Point]:
+        """
+        Compute bbox of all path items. We:
+        1) recurse with accumulated CTM,
+        2) merge child bboxes already transformed to this level,
+        3) at the end, expand once for stroke using the worst-case CTM row norms.
+        """
+        identity = Transform.identity()
+
+        def walk(
+            ctx: "GraphicsContext",
+            current_point: Point,
+            ambient_style: Optional[GraphicsStyle],
+            accum_tf: Transform,
+        ) -> tuple[BoundingBox, Point, float, float]:
+            bbox = BoundingBox.empty()
+            tf = accum_tf @ (ctx.transform or identity)
+            if not transformed:
+                tf = identity
+
+            merged_style = (
+                ambient_style.__class__.merge(ambient_style, ctx.style)
+                if ambient_style
+                else ctx.style
+            )
+
+            max_nx, max_ny = tf.row_norms()
+
+            for item in ctx.path_items:
+                if isinstance(item, GraphicsContext):
+                    child_bbox, end_point, cnx, cny = walk(
+                        item, current_point, merged_style, tf
+                    )
+                    bbox = bbox.merge(child_bbox)  # child bbox already in this space
+                    current_point = end_point
+                    max_nx = max(max_nx, cnx)
+                    max_ny = max(max_ny, cny)
+                elif hasattr(item, "bounding_box"):
+                    item_bbox, end_point = item.bounding_box(current_point)
+                    bbox = bbox.merge(item_bbox.transformed(tf))
+                    current_point = end_point
+
+            return bbox, current_point, max_nx, max_ny
+
+        # 1) geometric + collect CTM scales
+        geom_bbox, end_pt, nx, ny = walk(self, start, style, identity)
+
+        final_bbox = geom_bbox
+
+        if expand_for_stroke:
+            # 2) expand once for stroke with the effective style at *this* level
+            effective_style = (
+                style.__class__.merge(style, self.style) if style else self.style
+            )
+            final_bbox = geom_bbox.expanded_to_stroke(
+                effective_style, row_norms=(nx, ny)
+            )
+        return final_bbox, end_pt
+
     def render(
         self,
-        gsd_registry,
-        style: DrawingContext,
-        last_item,
-        initial_point,
+        resource_registry: "ResourceCatalog",
+        style: GraphicsStyle,
+        last_item: Renderable,
+        initial_point: Point,
         debug_stream=None,
         pfx=None,
         _push_stack=True,
-    ):
+    ) -> tuple[str, Renderable, Point]:
         render_list, last_item, initial_point = self.build_render_list(
-            gsd_registry,
+            resource_registry,
             style,
             last_item,
             initial_point,
@@ -4203,8 +4124,8 @@ class GraphicsContext:
 
     def render_debug(
         self,
-        gsd_registry,
-        style: DrawingContext,
+        resource_registry,
+        style,
         last_item,
         initial_point,
         debug_stream,
@@ -4212,7 +4133,7 @@ class GraphicsContext:
         _push_stack=True,
     ):
         return self.render(
-            gsd_registry,
+            resource_registry,
             style,
             last_item,
             initial_point,
@@ -4220,3 +4141,503 @@ class GraphicsContext:
             pfx,
             _push_stack=_push_stack,
         )
+
+
+class PaintSoftMask:
+    """
+    Wraps a vector path as a PDF soft mask (SMask) that can be attached to a
+    graphics state.
+
+    The provided `mask_path` is deep-copied and forced to render as an opaque
+    grayscale fill (white, alpha=1, nonzero rule, transparency disabled). During
+    rendering, the mask’s content stream is generated and its resource
+    dictionary is collected so it can be embedded as a Form XObject and
+    referenced from an ExtGState.
+    """
+
+    __slots__ = (
+        "mask_path",
+        "invert",
+        "resources",
+        "use_luminosity",
+        "object_id",
+        "matrix",
+    )
+
+    def __init__(
+        self,
+        mask_path: Union[PaintedPath, GraphicsContext],
+        invert: bool = False,
+        use_luminosity=False,
+        matrix=Transform.identity(),
+    ):
+        self.mask_path = deepcopy(mask_path)
+        self.invert = invert
+        self.use_luminosity = use_luminosity
+        self.resources = set()
+        self.object_id = 0
+        self.matrix = matrix
+
+        if not self.use_luminosity:
+            # Pure alpha mask -> force opaque white so shape defines coverage
+            self.mask_path.style.paint_rule = PathPaintRule.FILL_NONZERO
+            self.mask_path.style.fill_opacity = 1
+            self.mask_path.style.fill_color = "#ffffff"
+            self.mask_path.style.allow_transparency = False
+        else:
+            # Luminosity mask -> caller provided grayscale content (e.g., gray gradient)
+            self.mask_path.style.allow_transparency = False
+
+    def serialize(self):
+        tr = (
+            " /TR <</FunctionType 2 /Domain [0 1] /Range [0 1] /C0 [1] /C1 [0] /N 1>>"
+            if self.invert
+            else ""
+        )
+        mask_type = "/Luminosity" if self.use_luminosity else "/Alpha"
+        return f"<</S {mask_type} /G {self.object_id} 0 R{tr}>>"
+
+    def get_bounding_box(self) -> tuple[float, float, float, float]:
+        bounding_box, _ = self.mask_path.bounding_box(Point(0, 0))
+        return bounding_box.to_tuple()
+
+    def get_resource_dictionary(self, gfxstate_objs_per_name, pattern_objs_per_name):
+        """Build the resource dictionary for this soft mask, resolving GS & Pattern ids."""
+        resources_registered: dict[str, list] = {}
+        for resource_type, resource_id in self.resources:
+            resources_registered.setdefault(resource_type.value, set()).add(resource_id)
+
+        parts: list[str] = []
+
+        # ExtGState
+        if "ExtGState" in resources_registered and resources_registered["ExtGState"]:
+            parts.append(
+                Name("ExtGState").serialize()
+                + "<<"
+                + "".join(
+                    f"{Name(gs_name).serialize()} {gfxstate_objs_per_name[gs_name].id} 0 R"
+                    for gs_name in sorted(resources_registered["ExtGState"])
+                )
+                + ">>"
+            )
+
+        # Pattern
+        if "Pattern" in resources_registered and resources_registered["Pattern"]:
+            parts.append(
+                Name("Pattern").serialize()
+                + "<<"
+                + "".join(
+                    f"{Name(pat_name).serialize()} {pattern_objs_per_name[pat_name].id} 0 R"
+                    for pat_name in sorted(resources_registered["Pattern"])
+                )
+                + ">>"
+            )
+        return "<<" + "".join(parts) + ">>"
+
+    def render(self, resource_registry):
+        stream, _, _ = self.mask_path.render(
+            resource_registry,
+            style=GraphicsStyle(),
+            last_item=None,
+            initial_point=Point(0, 0),
+        )
+        self.resources = resource_registry.scan_stream(stream)
+        return stream
+
+    @staticmethod
+    def coverage_white(
+        node: Union[PaintedPath, GraphicsContext],
+    ) -> Union[PaintedPath, GraphicsContext]:
+        """
+        Return a deep-copied version of *node* whose appearance encodes only its
+        geometric coverage: every shape is converted to an **opaque white fill**
+        (nonzero rule), with **no stroke**, no soft mask, and inherited blend mode.
+
+        The transform/clipping/structure of the original node is preserved; only
+        paint-related attributes are normalized. This is intended for building the
+        “B” term of soft-mask expressions (coverage), where inside = 1 and
+        outside = 0.
+        """
+
+        def _force_white(gc: GraphicsContext):
+            # normalize the GC's own style
+            gc.style.paint_rule = PathPaintRule.FILL_NONZERO
+            gc.style.fill_color = "#ffffff"
+            gc.style.fill_opacity = 1
+            gc.style.stroke_color = None
+            gc.style.blend_mode = GraphicsStyle.INHERIT
+            gc.style.soft_mask = GraphicsStyle.INHERIT
+            # allow blending if we’ll invert via DIFFERENCE
+            gc.style.allow_transparency = True
+
+            # recurse into children
+            for child in gc.path_items:
+                if isinstance(child, GraphicsContext):
+                    _force_white(child)
+                elif isinstance(child, PaintedPath):
+                    child.style.paint_rule = PathPaintRule.FILL_NONZERO
+                    child.style.fill_color = "#ffffff"
+                    child.style.fill_opacity = 1
+                    child.style.stroke_color = None
+                    child.style.blend_mode = GraphicsStyle.INHERIT
+                    child.style.soft_mask = GraphicsStyle.INHERIT
+                    child.style.allow_transparency = True
+
+        new_node = clone_structure(node)
+        gc = (
+            new_node
+            if isinstance(new_node, GraphicsContext)
+            else new_node.get_graphics_context()
+        )
+        _force_white(gc)
+        return new_node
+
+    @staticmethod
+    def alpha_layers_from(node) -> Optional[GraphicsContext]:
+        """
+        Build a GraphicsContext that encodes the *alpha ramps* contributed by any
+        `GradientPaint` used by *node*. Each contributing PaintedPath yields one
+        rectangle covering its content-space bounding box; that rectangle is filled
+        with an `_AlphaGradientPaint` (the gradient’s *alpha channel only*).
+        Rectangles are stacked with `BM=Multiply` so multiple alpha sources
+        combine multiplicatively.
+        """
+        layers = []
+        for n in _iter_nodes(node):
+            if isinstance(n, PaintedPath):
+                for paint in (n.style.fill_color, n.style.stroke_color):
+                    if isinstance(paint, GradientPaint) and paint.has_alpha():
+                        bb = n.bounding_box(Point(0, 0), expand_for_stroke=False)[0]
+                        if bb.width <= 0 or bb.height <= 0:
+                            continue
+                        rect = PaintedPath()
+                        rect.rectangle(bb.x0, bb.y0, bb.width, bb.height)
+                        alpha_paint = _AlphaGradientPaint(
+                            gradient=paint.gradient,
+                            units=paint.units,
+                            gradient_transform=paint.gradient_transform,
+                            apply_page_ctm=paint.apply_page_ctm,
+                        )
+                        rect.style.fill_color = alpha_paint
+                        rect.style.stroke_color = None
+                        rect.style.paint_rule = PathPaintRule.FILL_NONZERO
+                        rect.style.allow_transparency = True
+                        layers.append(rect)
+
+        if not layers:
+            return None
+
+        A = GraphicsContext()
+        for layer in layers:
+            # If multiple alpha layers exist, multiply them together
+            layer.style.allow_transparency = True
+            layer.style.blend_mode = BlendMode.MULTIPLY
+            A.add_item(layer)
+        return A
+
+    @classmethod
+    def from_AB(
+        cls,
+        A: Optional[GraphicsContext],
+        B: Union[PaintedPath, GraphicsContext],
+        invert: bool,
+        registry,
+        region_bbox: Optional["BoundingBox"] = None,
+    ) -> "PaintSoftMask":
+        """
+        Construct a **luminosity soft mask** from two ingredients:
+
+        - **A**: Optional GraphicsContext encoding alpha ramps (e.g., the result of
+        :meth:`alpha_layers_from`). If ``None``, the effective alpha is 1.
+        - **B**: Coverage term (e.g., the result of :meth:`coverage_white`).
+
+        The mask luminance is:
+            - ``A × B``        when ``invert = False``
+            - ``A × (1 − B)``  when ``invert = True``
+
+        Implementation outline:
+        1. Compute the union bbox of A and B (no stroke expansion).
+        2. Paint a background rectangle: **black** for ``A×B`` or **white** for
+        ``A×(1−B)``.
+        3. Paint **B**; when ``invert=True``, set ``BM=Difference`` to obtain
+        ``1−B`` from the white background.
+        4. If A is present, paint it with ``BM=Multiply`` to apply the alpha ramp.
+        5. Wrap the result as a Form XObject and attach it as ``/SMask`` with
+        ``/S /Luminosity``.
+        """
+
+        # Decide the canvas/BBox for the soft mask
+        if region_bbox is not None:
+            union = region_bbox
+        else:
+            bb_A = (
+                A.bounding_box(Point(0, 0), expand_for_stroke=False)[0] if A else None
+            )
+            bb_B = B.bounding_box(Point(0, 0), expand_for_stroke=False)[0]
+            union = bb_B if bb_A is None else bb_A.merge(bb_B)
+
+        canvas = GraphicsContext()
+
+        # Background: black for A×B, white for A×(1−B)
+        bg = PaintedPath()
+        bg.rectangle(union.x0, union.y0, union.width, union.height)
+        bg.style.fill_color = "#000000" if not invert else "#ffffff"
+        bg.style.fill_opacity = 1
+        bg.style.stroke_color = None
+        bg.style.allow_transparency = True
+        canvas.add_item(bg)
+
+        # Paint B (optionally build 1−B using Difference on white bg)
+        if invert:
+            B.style.allow_transparency = True
+            B.style.blend_mode = BlendMode.DIFFERENCE
+        canvas.add_item(B)
+
+        # Multiply by A if present
+        if A is not None:
+            A.style.allow_transparency = True
+            A.style.blend_mode = BlendMode.MULTIPLY
+            canvas.add_item(A)
+
+        sm = cls(canvas, invert=False, use_luminosity=True)
+        sm.mask_path.style.allow_transparency = True
+        _ = sm.render(registry)
+        sm.object_id = registry.register_soft_mask(sm)
+        return sm
+
+
+def _iter_nodes(node):
+    # Yields all GraphicsContext/PaintedPath nodes recursively
+    if isinstance(node, PaintedPath):
+        yield node
+        root_gc = node.get_graphics_context()
+        for ch in root_gc.path_items:
+            if isinstance(ch, (GraphicsContext, PaintedPath)):
+                yield from _iter_nodes(ch)
+    elif isinstance(node, GraphicsContext):
+        yield node
+        for ch in node.path_items:
+            if isinstance(ch, (GraphicsContext, PaintedPath)):
+                yield from _iter_nodes(ch)
+
+
+def _disable_auto_alpha(node: Union[PaintedPath, GraphicsContext]) -> None:
+    for n in _iter_nodes(node):
+        if isinstance(n, PaintedPath):
+            for attr in ("fill_color", "stroke_color"):
+                col = getattr(n.style, attr)
+                if isinstance(col, GradientPaint):
+                    # decide from the gradient, not col.has_alpha() (which checks skip_alpha)
+                    if col.gradient and col.gradient.has_alpha():
+                        col.skip_alpha = True
+
+
+# pylint: disable=protected-access
+def clone_structure(node):
+    if isinstance(node, GraphicsContext):
+        new = GraphicsContext()
+        new.style = deepcopy(node.style)
+        new.transform = node.transform
+        new.clipping_path = node.clipping_path
+        new.path_items = [
+            (
+                clone_structure(ch)
+                if isinstance(ch, (GraphicsContext, PaintedPath))
+                else ch
+            )
+            for ch in node.path_items
+        ]
+        return new
+    if isinstance(node, PaintedPath):
+        new = PaintedPath.__new__(PaintedPath)
+        root = clone_structure(node.get_graphics_context())
+        object.__setattr__(new, "_root_graphics_context", root)
+        object.__setattr__(new, "_graphics_context", root)
+        object.__setattr__(new, "_closed", node._closed)
+        object.__setattr__(new, "_close_context", root)
+        object.__setattr__(new, "_starter_move", node._starter_move)
+        return new
+    return node
+
+
+class PaintComposite:
+
+    @dataclass(frozen=True)
+    class _Step:
+        draw: str  # "source" or "backdrop"
+        mask_from: Optional[str]  # "source" | "backdrop" | None
+        invert: bool = False
+
+    _MODES = {
+        CompositingOperation.SOURCE: (_Step("source", None),),
+        CompositingOperation.DESTINATION: (_Step("backdrop", None),),
+        CompositingOperation.SOURCE_OVER: (
+            _Step("backdrop", None),
+            _Step("source", None),
+        ),
+        CompositingOperation.DESTINATION_OVER: (
+            _Step("source", None),
+            _Step("backdrop", None),
+        ),
+        CompositingOperation.SOURCE_IN: (_Step("source", "backdrop"),),
+        CompositingOperation.DESTINATION_IN: (_Step("backdrop", "source"),),
+        CompositingOperation.SOURCE_OUT: (_Step("source", "backdrop", True),),
+        CompositingOperation.DESTINATION_OUT: (_Step("backdrop", "source", True),),
+        CompositingOperation.SOURCE_ATOP: (
+            _Step("backdrop", "source", True),
+            _Step("source", "backdrop"),
+        ),
+        CompositingOperation.DESTINATION_ATOP: (
+            _Step("source", "backdrop", True),
+            _Step("backdrop", "source"),
+        ),
+        CompositingOperation.XOR: (
+            _Step("source", "backdrop", True),
+            _Step("backdrop", "source", True),
+        ),
+        CompositingOperation.CLEAR: tuple(),
+    }
+
+    def __init__(self, backdrop, source, operation: CompositingOperation):
+        if not isinstance(backdrop, (PaintedPath, GraphicsContext)) or not isinstance(
+            source, (PaintedPath, GraphicsContext)
+        ):
+            print(type(backdrop))
+            print(type(source))
+            raise TypeError("PaintComposite requires two PaintedPath instances.")
+        self.backdrop = backdrop
+        self.source = source
+        self.mode = operation
+
+        if self.mode not in self._MODES:
+            raise NotImplementedError(
+                f"Compositing mode '{self.mode.value}' is not yet supported."
+            )
+
+    @classmethod
+    def _with_mask(
+        cls,
+        path: Union[PaintedPath, GraphicsContext],
+        mask_from: Union[PaintedPath, GraphicsContext],
+        invert: bool,
+        resource_registry,
+    ) -> Union[PaintedPath, GraphicsContext]:
+        p = deepcopy(path)
+
+        A = PaintSoftMask.alpha_layers_from(p)
+        B = PaintSoftMask.coverage_white(mask_from)
+
+        bb_p = p.bounding_box(Point(0, 0), expand_for_stroke=False)[0]
+        bb_B = B.bounding_box(Point(0, 0), expand_for_stroke=False)[0]
+        region_bbox = bb_p.merge(bb_B)
+
+        sm = PaintSoftMask.from_AB(
+            A, B, invert, resource_registry, region_bbox=region_bbox
+        )
+        p.style.soft_mask = sm
+        _disable_auto_alpha(p)
+        return p
+
+    def _pick(self, which: str) -> Union[PaintedPath, GraphicsContext]:
+        return self.source if which == "source" else self.backdrop
+
+    def render(
+        self,
+        resource_registry,
+        style,
+        last_item,
+        initial_point,
+        debug_stream=None,
+        pfx=None,
+    ):
+        steps = self._MODES[self.mode]
+        if not steps:  # CLEAR
+            return "", last_item, initial_point
+
+        parts = []
+        for st in steps:
+            node = self._pick(st.draw)
+            if st.mask_from is not None:
+                node = self._with_mask(
+                    node, self._pick(st.mask_from), st.invert, resource_registry
+                )
+            s, last_item, initial_point = node.render(
+                resource_registry, style, last_item, initial_point, debug_stream, pfx
+            )
+            parts.append(s)
+        return " ".join(parts), last_item, initial_point
+
+    def render_debug(
+        self, resource_registry, style, last_item, initial_point, debug_stream, pfx
+    ):
+        debug_stream.write(f"{pfx}<PaintComposite mode={self.mode}>\n")
+        return self.render(
+            resource_registry, style, last_item, initial_point, debug_stream, pfx
+        )
+
+
+class PathPen(BasePen):
+    def __init__(self, pdf_path, *args, **kwargs):
+        self.pdf_path = pdf_path
+        self.last_was_line_to = False
+        self.first_is_move = None
+        super().__init__(*args, **kwargs)
+
+    def _moveTo(self, pt):
+        self.pdf_path.move_to(*pt)
+        self.last_was_line_to = False
+        if self.first_is_move is None:
+            self.first_is_move = True
+
+    def _lineTo(self, pt):
+        self.pdf_path.line_to(*pt)
+        self.last_was_line_to = True
+        if self.first_is_move is None:
+            self.first_is_move = False
+
+    def _curveToOne(self, pt1, pt2, pt3):
+        self.pdf_path.curve_to(
+            x1=pt1[0], y1=pt1[1], x2=pt2[0], y2=pt2[1], x3=pt3[0], y3=pt3[1]
+        )
+        self.last_was_line_to = False
+        if self.first_is_move is None:
+            self.first_is_move = False
+
+    def _qCurveToOne(self, pt1, pt2):
+        self.pdf_path.quadratic_curve_to(x1=pt1[0], y1=pt1[1], x2=pt2[0], y2=pt2[1])
+        self.last_was_line_to = False
+        if self.first_is_move is None:
+            self.first_is_move = False
+
+    def arcTo(self, rx, ry, rotation, arc, sweep, end):
+        self.pdf_path.arc_to(
+            rx=rx,
+            ry=ry,
+            rotation=rotation,
+            large_arc=arc,
+            positive_sweep=sweep,
+            x=end[0],
+            y=end[1],
+        )
+        self.last_was_line_to = False
+        if self.first_is_move is None:
+            self.first_is_move = False
+
+    def _closePath(self):
+        # The fonttools parser inserts an unnecessary explicit line back to the start
+        # point of the path before actually closing it. Let's get rid of that again.
+        if self.last_was_line_to:
+            self.pdf_path.remove_last_path_element()
+        self.pdf_path.close()
+
+
+class GlyphPathPen(PathPen):
+    """A pen that can be used to draw glyphs into a `PaintedPath`."""
+
+    def _closePath(self):
+        """
+        The difference between GlyphPathPen and PathPen is that GlyphPathPen does not
+        remove the last path element before closing the path.
+        This last line back to start point is necessary for correctly rendering glyphs.
+        """
+        self.pdf_path.close()

@@ -4,6 +4,8 @@ Utilities to parse SVG graphics into fpdf.drawing objects.
 The contents of this module are internal to fpdf2, and not part of the public API.
 They may change at any time without prior warning or any deprecation period,
 in non-backward-compatible ways.
+
+Usage documentation at: <https://py-pdf.github.io/fpdf2/SVG.html>
 """
 
 import logging, math, re, warnings
@@ -11,7 +13,6 @@ from numbers import Number
 from typing import NamedTuple
 
 from fontTools.svgLib.path import parse_path
-from fontTools.pens.basePen import BasePen
 
 from .enums import PathPaintRule
 
@@ -25,14 +26,14 @@ except ImportError:
     from xml.etree.ElementTree import fromstring as parse_xml_str  # nosec
 
 from . import html
+from .drawing_primitives import color_from_hex_string, color_from_rgb_string, Transform
+
 from .drawing import (
-    color_from_hex_string,
-    color_from_rgb_string,
     GraphicsContext,
     GraphicsStyle,
     PaintedPath,
+    PathPen,
     ClippingPath,
-    Transform,
 )
 from .image_datastructures import ImageCache, VectorImageInfo
 from .output import stream_content_for_raster_image
@@ -236,7 +237,7 @@ def clamp_float(min_val, max_val):
 
 @force_nodocument
 def inheritable(value, converter=lambda value: value):
-    if value == "inherit":
+    if value in ("inherit", "currentColor"):
         return GraphicsStyle.INHERIT
 
     return converter(value)
@@ -551,61 +552,6 @@ def convert_transforms(tfstr):
     return transform
 
 
-class PathPen(BasePen):
-    def __init__(self, pdf_path, *args, **kwargs):
-        self.pdf_path = pdf_path
-        self.last_was_line_to = False
-        self.first_is_move = None
-        super().__init__(*args, **kwargs)
-
-    def _moveTo(self, pt):
-        self.pdf_path.move_to(*pt)
-        self.last_was_line_to = False
-        if self.first_is_move is None:
-            self.first_is_move = True
-
-    def _lineTo(self, pt):
-        self.pdf_path.line_to(*pt)
-        self.last_was_line_to = True
-        if self.first_is_move is None:
-            self.first_is_move = False
-
-    def _curveToOne(self, pt1, pt2, pt3):
-        self.pdf_path.curve_to(
-            x1=pt1[0], y1=pt1[1], x2=pt2[0], y2=pt2[1], x3=pt3[0], y3=pt3[1]
-        )
-        self.last_was_line_to = False
-        if self.first_is_move is None:
-            self.first_is_move = False
-
-    def _qCurveToOne(self, pt1, pt2):
-        self.pdf_path.quadratic_curve_to(x1=pt1[0], y1=pt1[1], x2=pt2[0], y2=pt2[1])
-        self.last_was_line_to = False
-        if self.first_is_move is None:
-            self.first_is_move = False
-
-    def arcTo(self, rx, ry, rotation, arc, sweep, end):
-        self.pdf_path.arc_to(
-            rx=rx,
-            ry=ry,
-            rotation=rotation,
-            large_arc=arc,
-            positive_sweep=sweep,
-            x=end[0],
-            y=end[1],
-        )
-        self.last_was_line_to = False
-        if self.first_is_move is None:
-            self.first_is_move = False
-
-    def _closePath(self):
-        # The fonttools parser inserts an unnecessary explicit line back to the start
-        # point of the path before actually closing it. Let's get rid of that again.
-        if self.last_was_line_to:
-            self.pdf_path.remove_last_path_element()
-        self.pdf_path.close()
-
-
 @force_nodocument
 def svg_path_converter(pdf_path, svg_path):
     pen = PathPen(pdf_path)
@@ -688,7 +634,7 @@ class SVGObject:
         if viewbox is None:
             self.viewbox = None
         else:
-            viewbox.strip()
+            viewbox = viewbox.strip()
             vx, vy, vw, vh = [float(num) for num in NUMBER_SPLIT.split(viewbox)]
             if (vw < 0) or (vh < 0):
                 raise ValueError(f"invalid negative width/height in viewbox {viewbox}")
@@ -719,7 +665,7 @@ class SVGObject:
         If the SVG document size is specified in absolute units, then it is not scaled.
 
         Args:
-            pdf (fpdf.FPDF): the pdf to use the page size of.
+            pdf (fpdf.fpdf.FPDF): the pdf to use the page size of.
             align_viewbox (bool): if True, mimic some of the SVG alignment rules if the
                 viewbox aspect ratio does not match that of the viewport.
 
@@ -820,7 +766,7 @@ class SVGObject:
         The page viewport is used for sizing the SVG.
 
         Args:
-            pdf (fpdf.FPDF): the document to which the converted SVG is rendered.
+            pdf (fpdf.fpdf.FPDF): the document to which the converted SVG is rendered.
             x (Number): abscissa of the converted SVG's top-left corner.
             y (Number): ordinate of the converted SVG's top-left corner.
             debug_stream (io.TextIO): the stream to which rendering debug info will be
@@ -847,6 +793,13 @@ class SVGObject:
         """Produce lookups for groups and paths inside the <defs> tag"""
         for child in defs:
             if child.tag in xmlns_lookup("svg", "g"):
+                self.build_group(child)
+            elif child.tag in xmlns_lookup("svg", "a"):
+                # <a> tags aren't supported but we need to recurse into them to
+                # render nested elements.
+                LOGGER.warning(
+                    "Ignoring unsupported SVG tag: <a> (contributions are welcome to add support for it)",
+                )
                 self.build_group(child)
             elif child.tag in xmlns_lookup("svg", "path"):
                 self.build_path(child)
@@ -917,6 +870,13 @@ class SVGObject:
             if child.tag in xmlns_lookup("svg", "defs"):
                 self.handle_defs(child)
             elif child.tag in xmlns_lookup("svg", "g"):
+                pdf_group.add_item(self.build_group(child), False)
+            elif child.tag in xmlns_lookup("svg", "a"):
+                # <a> tags aren't supported but we need to recurse into them to
+                # render nested elements.
+                LOGGER.warning(
+                    "Ignoring unsupported SVG tag: <a> (contributions are welcome to add support for it)",
+                )
                 pdf_group.add_item(self.build_group(child), False)
             elif child.tag in xmlns_lookup("svg", "path"):
                 pdf_group.add_item(self.build_path(child), False)
@@ -1040,7 +1000,7 @@ class SVGImage(NamedTuple):
         )
 
     @force_nodocument
-    def render(self, _gsd_registry, _style, last_item, initial_point):
+    def render(self, _resource_registry, _style, last_item, initial_point):
         image_cache = self.svg_obj and self.svg_obj.image_cache
         if not image_cache:
             raise AssertionError(
@@ -1070,10 +1030,10 @@ class SVGImage(NamedTuple):
 
     @force_nodocument
     def render_debug(
-        self, gsd_registry, style, last_item, initial_point, debug_stream, _pfx
+        self, resource_registry, style, last_item, initial_point, debug_stream, _pfx
     ):
         stream_content, last_item, initial_point = self.render(
-            gsd_registry, style, last_item, initial_point
+            resource_registry, style, last_item, initial_point
         )
         debug_stream.write(f"{self.href} rendered as: {stream_content}\n")
         return stream_content, last_item, initial_point

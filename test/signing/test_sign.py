@@ -1,12 +1,14 @@
 from pathlib import Path
+from sys import version_info
 
 
+from pytest import mark
 from fpdf import FPDF
 from test.conftest import assert_pdf_equal, check_signature, EPOCH
 
 
 HERE = Path(__file__).resolve().parent
-TRUSTED_CERT_PEMS = (HERE / "signing.crt.pem",)
+TRUSTED_CERT_PEMS = (HERE / "signing-certificate.crt",)
 
 
 def test_sign_pkcs12(tmp_path):
